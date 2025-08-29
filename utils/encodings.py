@@ -1,6 +1,8 @@
 import json
 import numpy as np
-from typing import Sequence, List
+from typing import Optional, Sequence, List
+
+import torch
 # ---------------------------
 # Utilities: RLE encode / decode
 # ---------------------------
@@ -62,3 +64,21 @@ def save_rle_list(rle_list: Sequence[str], filepath: str):
 def load_rle_list(filepath: str) -> List[str]:
     with open(filepath, "r") as f:
         return json.load(f)
+
+@torch.no_grad()
+def board_hash(states: torch.Tensor, powers: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Compute per-board hash for a batch of boards.
+
+    Args:
+        states: (N,H,W) bool or uint8 tensor
+        powers: (H*W,) precomputed tensor for hashing. If None, generates on the fly.
+
+    Returns:
+        hashes: (N,) int64 tensor
+    """
+    N, H, W = states.shape
+    flat = states.view(N, -1).to(torch.int64)
+    if powers is None:
+        powers = torch.arange(1, H*W + 1, device=states.device, dtype=torch.int64)
+    return (flat * powers).sum(dim=1)

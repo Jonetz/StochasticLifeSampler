@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from typing import Optional, Tuple, List, Union, Sequence
 import numpy as np
 from core.Board import Board
-from utils.encodings import save_rle_list, load_rle_list, rle_decode_binary
+from utils.encodings import board_hash, save_rle_list, load_rle_list, rle_decode_binary
 from PIL import Image
 
 """
@@ -124,7 +124,7 @@ class GoLEngine:
                 traj.append(s.clone())
             elif self.skip_osci:
                 flat = s.view(N, -1).to(torch.int64)
-                hashes = (flat * powers).sum(dim=1)
+                hashes = board_hash(s, powers)
                 mask = torch.isin(hashes, seen_hashes)
                 if mask.any():
                     # Oscillation detected
@@ -155,7 +155,7 @@ class GoLEngine:
     # Visualization and saving
     # ---------------------------    
     def trajectory_to_gif(self,
-                        trajectory: Sequence[torch.Tensor],
+                        trajectory: Union[Sequence[torch.Tensor], torch.Tensor],
                         filepath: str,
                         fps: int = 10,
                         scale: int = 4,
@@ -163,6 +163,8 @@ class GoLEngine:
         """
         Save a trajectory to GIF. Corrected for viewing issues.
         """
+        if torch.is_tensor(trajectory):
+            trajectory = [trajectory[i] for i in range(trajectory.shape[0])]
         frames = []
         for t in trajectory:
             # convert to numpy 2D array

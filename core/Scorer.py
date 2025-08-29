@@ -1,22 +1,31 @@
+from typing import Union
 import numpy as np
 import torch
 from scipy.stats import entropy
 from itertools import combinations
 
+from core.Board import Board
 from core.GOLEngine import GoLEngine 
 
 # ---------- SCORERS ----------
 class Scorer:
     """Base class for evaluating interestingness."""
-    def score(self, trajectory: list) -> float:
+    def score(self, batch: Union[Board, torch.Tensor]) -> float:
         raise NotImplementedError
 
 # ---------- 1. AliveCellCountScorer ----------
 class AliveCellCountScorer(Scorer):
-    """Score depends only on the current board: fraction of alive cells."""
-    def score(self, board: torch.Tensor) -> float:
-        b = board if isinstance(board, torch.Tensor) else board.tensor
-        return float(b.sum().float() / b.numel())
+    """Batchified: returns fraction of alive cells per board in the batch."""
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        """
+        batch: (N, H, W) tensor, dtype=uint8 or bool
+        returns: (N,) tensor of alive fractions
+        """
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        batch = batch.float()
+        alive_frac = batch.sum(dim=(1, 2)) / (batch.shape[1] * batch.shape[2])
+        return alive_frac
 
 # ---------- 2. StabilityScorer ----------
 class StabilityScorer(Scorer):
@@ -26,13 +35,16 @@ class StabilityScorer(Scorer):
         self.engine = engine
         self.steps = steps
 
-    def score(self, boards: list[torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         """
-        boards: list of initial board tensors (N, H, W)
+        batch: list of initial board tensors (N, H, W)
         Returns: float or tensor of scores per board
         """
-        # Batch all boards
-        batch = torch.stack(boards, dim=0).to(self.engine.device)
+        # Batch all batch
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        if not batch.device == self.engine.device:
+            batch = batch.to(self.engine.device)
         _, traj = self.engine.simulate(batch, steps=self.steps, return_trajectory=True)
         traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
         diffs = (traj_t[1:] == traj_t[:-1]).float()  # (T-1, N, H, W)
@@ -47,8 +59,11 @@ class ChangeRateScorer(Scorer):
         self.engine = engine
         self.steps = steps
 
-    def score(self, boards: list[torch.Tensor]) -> torch.Tensor:
-        batch = torch.stack(boards, dim=0).to(self.engine.device)
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        if not batch.device == self.engine.device:
+            batch = batch.to(self.engine.device)
         _, traj = self.engine.simulate(batch, steps=self.steps, return_trajectory=True)
         traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
         flips = (traj_t[1:] != traj_t[:-1]).float()
@@ -57,32 +72,52 @@ class ChangeRateScorer(Scorer):
 
 # ---------- 4. EntropyScorer ----------
 class EntropyScorer(Scorer):
-    def score(self, board: torch.Tensor) -> float:
-        b = board if isinstance(board, torch.Tensor) else board.tensor
-        alive_frac = b.float().mean()
+    """Batchified: entropy per board, dim 0 is batch dimension."""
+    def __init__(self, engine: GoLEngine, steps: int = 10):
+        super().__init__()
+        self.engine = engine
+        self.steps = steps
+
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        """
+        batch: (N, H, W) tensor, dtype=uint8 or bool
+        returns: (N,) tensor of entropies
+        """
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        if not batch.device == self.engine.device:
+            batch = batch.to(self.engine.device)
+        batch = batch.float()
+        alive_frac = batch.mean(dim=(1, 2))  # fraction of alive cells per board
         alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
-        ent = -(alive_frac*torch.log(alive_frac) + (1-alive_frac)*torch.log(1-alive_frac))
-        return float(ent)
+        ent = -(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac))
+        return ent
 
 
 # ---------- 5. DiversityScorer ----------
 class DiversityScorer(Scorer):
-    """Diversity as hash uniqueness over multiple boards is not applicable in single-board scoring.
-       We can instead define a proxy: fraction of alive cells as a “diversity metric”."""
-    def score(self, board: torch.Tensor) -> float:
-        # simple proxy: alive fraction
-        b = board if isinstance(board, torch.Tensor) else board.tensor
-        alive_frac = b.float().mean()
-        return float(alive_frac * (1 - alive_frac))  # max when ~50% alive
+    """Batchified diversity proxy: alive fraction * (1-alive fraction) per board."""
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        """
+        batch: (N, H, W) tensor
+        returns: (N,) tensor of diversity scores
+        """
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        batch = batch.float()
+        alive_frac = batch.mean(dim=(1, 2))
+        return alive_frac * (1 - alive_frac)
+
 
 
 # ---------- 6. CompositeScorer ----------
-class CompositeScorer(Scorer):
-    """Combine AliveCellCount + Entropy + Diversity as single-board proxy."""
-    def __init__(self):
-        self.scorers = [AliveCellCountScorer(), EntropyScorer(), DiversityScorer()]
-    def score(self, board: torch.Tensor) -> float:
-        return float(np.mean([s.score(board) for s in self.scorers]))
+# TODO Make this with scorers as parameters
+#class CompositeScorer(Scorer):
+#    """Combine AliveCellCount + Entropy + Diversity as single-board proxy."""
+#    def __init__(self):
+#        self.scorers = [AliveCellCountScorer(), DiversityScorer()]
+#    def score(self, board: torch.Tensor) -> float:
+#        return float(np.mean([s.score(board) for s in self.scorers]))
 
 
 # ---------- 7. OscillationScorer ----------
@@ -93,8 +128,9 @@ class OscillationScorer(Scorer):
         self.engine = engine
         self.steps = steps
 
-    def score(self, boards: list[torch.Tensor]) -> torch.Tensor:
-        batch = torch.stack(boards, dim=0).to(self.engine.device)
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
         _, traj = self.engine.simulate(batch, steps=self.steps, return_trajectory=True)
         traj_t = [b.clone() for b in traj]  # list of (N,H,W)
         N = batch.shape[0]
