@@ -2,6 +2,10 @@
 import os
 import sys
 
+from tqdm import tqdm
+
+from core.ComplexProposal import PatternInsertProposal
+
 # Add the root project directory to the system path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -13,6 +17,7 @@ import time
 import cProfile, pstats
 import numpy as np
 
+"""
 if __name__ == "__main__":
     
     profiler = cProfile.Profile()
@@ -53,7 +58,6 @@ if __name__ == "__main__":
     counts = final_board._states.sum(dim=(1, 2)).cpu().numpy()
     for i, c in enumerate(counts):
         print(f"Chain {i}: final live cells = {int(c)}")
-    """
 
     # ---------------------------
     # Glider
@@ -109,3 +113,61 @@ if __name__ == "__main__":
 
     
     """
+
+from core.Board import Board
+from core.GOLEngine import GoLEngine
+from core.ComplexScorer import MethuselahScorer
+from core.Proposal import CombinedProposal, SingleFlipProposal, BlockFlipProposal
+from mcmc.Chain import Chain
+from mcmc.Sampler import Sampler
+from utils.visualization import plot_history
+
+def main():
+    device = "cuda"
+    engine = GoLEngine(device=device)
+    steps = 256
+    box_size = (25,25)
+
+    # Init boards
+    boards = Board.from_shape(N=3, H=350, W=350, device=device, fill_prob=0.1, fill_shape=(10,10))
+
+    # Scorer
+    scorer = MethuselahScorer(engine, steps=1024)
+
+    
+    # Chains with different proposals
+    chains = [
+        Chain(boards.clone(), scorer, SingleFlipProposal(engine, use_activity_boundary=False, box_size=box_size)),
+        Chain(boards.clone(), scorer, BlockFlipProposal(engine, box_size=box_size)),
+        Chain(boards.clone(), scorer, CombinedProposal(engine, [
+            (SingleFlipProposal(engine, use_activity_boundary=False, box_size=box_size), 25), 
+            (BlockFlipProposal(engine, box_size=(25,25)), 75)])),
+        Chain(boards.clone(), scorer, PatternInsertProposal(engine,
+                                 rle_folder=r"C:\Users\jonas\Desktop\GOL\data\5x5",
+                                 max_files=500,
+                                 box_size=box_size,        # place patterns only inside central 32x32
+                                 target_shape=(5,5),  # how RLEs are decoded (optional)
+                                 device='cuda'))
+    ]
+
+    # Sampler
+    sampler = Sampler(chains)
+    results, history = sampler.run(steps=steps, log_interval=1)
+
+    plot_history(history, show_chains=True)
+    
+    folder = os.path.join('results', 'mcmc')
+    os.makedirs(folder, exist_ok=True)
+    for idx, r in results.items():
+        final_board = r["final_board"]
+        _, traj = engine.simulate(final_board, steps=2048, return_trajectory=True)
+        
+        # traj is a list of (1,H,W) or (B,H,W) tensors, convert to numpy
+        traj_np = [b[0].cpu().numpy() if b.ndim == 3 else b.cpu().numpy() for b in traj]
+
+        filename = os.path.join(folder, f"chain_{idx}_{int(r['final_score'].mean())}.gif")
+        engine.trajectory_to_gif(traj_np, filename)
+
+
+if __name__ == "__main__":
+    main()
