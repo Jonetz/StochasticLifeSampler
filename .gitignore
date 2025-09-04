@@ -1,1 +1,4 @@
 data/*
+*.gif
+results/*
+*/__pycache__/*
