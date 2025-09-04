@@ -32,6 +32,8 @@ class Board:
         """
         if device is not None:
             states = states.to(device)
+        if states.ndim == 2:
+            states = states.unsqueeze(0)
         assert states.ndim == 3, "states must be a 3D tensor (N, H, W)"
         self._states = states
         self.idx = idx
@@ -81,16 +83,43 @@ class Board:
             state_t = state.to(self._states.device)
         assert state_t.shape == (self.H(), self.W()), f"Shape mismatch, got {state_t.shape}"
         self._states[index] = state_t
-
+        
     @classmethod
-    def from_shape(cls, N: int, H: int, W: int, device: Union[str, torch.device] = "cuda", fill_prob: float = 0.0):
+    def from_shape(cls, 
+                N: int, H: int, W: int, 
+                device: Union[str, torch.device] = "cuda", 
+                fill_prob: float = 0.0,
+                fill_shape: Optional[Tuple[int, int]] = None):
         """
-        Create a Batched Board with random init (fill_prob) or empty.
+        Create a Batched Board of size (H, W), optionally filling only a centered subregion.
+
+        Args:
+            N: number of boards (batch size)
+            H, W: board dimensions
+            device: torch device
+            fill_prob: probability of a cell being alive in the filled region
+            fill_shape: (Ah, Aw) size of the subregion to randomly fill; if None, fills entire board
         """
-        if fill_prob <= 0.0:
-            t = torch.zeros((N, H, W), dtype=torch.uint8, device=device)
-        else:
-            t = (torch.rand((N, H, W), device=device) < float(fill_prob)).to(torch.uint8)
+        t = torch.zeros((N, H, W), dtype=torch.uint8, device=device)
+
+        if fill_prob > 0.0:
+            if fill_shape is None:
+                # fill entire board
+                t = (torch.rand((N, H, W), device=device) < fill_prob).to(torch.uint8)
+            else:
+                Ah, Aw = fill_shape
+                if Ah > H or Aw > W:
+                    raise ValueError(f"fill_shape {fill_shape} cannot be larger than board size {(H, W)}")
+                
+                # compute offsets to center the subregion
+                offset_h = (H - Ah) // 2
+                offset_w = (W - Aw) // 2
+
+                # fill only the subregion
+                t[:, offset_h:offset_h+Ah, offset_w:offset_w+Aw] = (
+                    (torch.rand((N, Ah, Aw), device=device) < fill_prob).to(torch.uint8)
+                )
+
         return cls(t, idx=None, device=device, meta={})
 
     @classmethod

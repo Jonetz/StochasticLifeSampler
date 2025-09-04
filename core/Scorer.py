@@ -3,10 +3,12 @@ import numpy as np
 import torch
 from scipy.stats import entropy
 from itertools import combinations
+import hashlib
 
 from core.Board import Board
 from core.GOLEngine import GoLEngine 
 
+DEBUG = False
 # ---------- SCORERS ----------
 class Scorer:
     """Base class for evaluating interestingness."""
@@ -25,7 +27,7 @@ class AliveCellCountScorer(Scorer):
             batch = batch.tensor
         batch = batch.float()
         alive_frac = batch.sum(dim=(1, 2)) / (batch.shape[1] * batch.shape[2])
-        return alive_frac
+        return alive_frac.cpu()
 
 # ---------- 2. StabilityScorer ----------
 class StabilityScorer(Scorer):
@@ -49,7 +51,7 @@ class StabilityScorer(Scorer):
         traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
         diffs = (traj_t[1:] == traj_t[:-1]).float()  # (T-1, N, H, W)
         sims = diffs.mean(dim=(0,2,3))  # mean over time + spatial dims → per board
-        return sims.cpu().numpy() if sims.numel() > 1 else float(sims)
+        return sims.cpu()
 
 # ---------- 3. ChangeRateScorer ----------
 class ChangeRateScorer(Scorer):
@@ -68,7 +70,7 @@ class ChangeRateScorer(Scorer):
         traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
         flips = (traj_t[1:] != traj_t[:-1]).float()
         rates = flips.mean(dim=(0,2,3))
-        return rates.cpu().numpy() if rates.numel() > 1 else float(rates)
+        return rates.cpu()
 
 # ---------- 4. EntropyScorer ----------
 class EntropyScorer(Scorer):
@@ -91,7 +93,7 @@ class EntropyScorer(Scorer):
         alive_frac = batch.mean(dim=(1, 2))  # fraction of alive cells per board
         alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
         ent = -(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac))
-        return ent
+        return ent.cpu()
 
 
 # ---------- 5. DiversityScorer ----------
@@ -106,7 +108,7 @@ class DiversityScorer(Scorer):
             batch = batch.tensor
         batch = batch.float()
         alive_frac = batch.mean(dim=(1, 2))
-        return alive_frac * (1 - alive_frac)
+        return (alive_frac * (1 - alive_frac)).cpu()
 
 
 
@@ -128,6 +130,16 @@ class OscillationScorer(Scorer):
         self.engine = engine
         self.steps = steps
 
+    def _hash_board(self, board: torch.Tensor) -> str:
+        """
+        Stable hash of a single board state.
+        Proceed with caution
+
+        board: (H,W) binary tensor
+        returns: hex digest string
+        """
+        return hashlib.sha1(board.cpu().numpy().tobytes()).hexdigest()
+
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         if not torch.is_tensor(batch):
             batch = batch.tensor
@@ -135,16 +147,21 @@ class OscillationScorer(Scorer):
         traj_t = [b.clone() for b in traj]  # list of (N,H,W)
         N = batch.shape[0]
         periods = torch.zeros(N, device=self.engine.device)
-        # Compute hashes per board per timestep
-        flat_size = batch.shape[1]*batch.shape[2]
-        powers = torch.arange(1, flat_size+1, device=self.engine.device, dtype=torch.int64)
+
         for n in range(N):
             seen = {}
             for t in range(len(traj_t)):
-                b = traj_t[t][n].view(-1).to(torch.int64)
-                h = (b * powers).sum().item()
+                h = self._hash_board(traj_t[t][n])
                 if h in seen:
                     periods[n] = t - seen[h]
+                    if DEBUG:
+                        print(f"[Board {n}] Repeat found at step {t}, "
+                              f"period = {periods[n].item()}, "
+                              f"first seen at step {seen[h]}")
                     break
                 seen[h] = t
-        return periods.cpu().numpy() if periods.numel() > 1 else float(periods)
+
+            if DEBUG and periods[n] == 0:
+                print(f"[Board {n}] No repeat found within {self.steps} steps")
+
+        return periods.cpu()
