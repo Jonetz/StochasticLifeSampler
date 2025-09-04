@@ -100,9 +100,18 @@ class GoLEngine:
 
         if isinstance(board, Board):
             states = board._states.bool()
+        elif isinstance(board, np.ndarray):
+            states = torch.tensor(board).bool().to(self.device)
         else:
             states = board.bool()
-        N, H, W = states.shape
+
+        if states.dim() == 2:
+            states = states.unsqueeze(0)
+            N, H, W = states.shape
+        elif states.dim() == 3:
+            N, H, W = states.shape
+        else:
+            raise ValueError(f'The board should have 2 or 3 dimensions (N, H, W) not {states.dim()} and shape {states.shape}!')
 
         traj: Optional[List[torch.Tensor]] = [] if return_trajectory else None
         seen_hashes = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -111,8 +120,8 @@ class GoLEngine:
             traj.append(s.clone())
 
         # Precompute powers for hashing
-        flat_size = H * W
-        powers = torch.arange(1, flat_size + 1, device=self.device, dtype=torch.int64)
+        kernel = torch.randint(1, 2**16, size=(3, 3), device=self.device, dtype=torch.int64).float()
+        s = s.to(self.device)
 
         for t in range(steps):
             s = GoLEngine.step_jit(s, self.kernel, self.pad_flag)
@@ -123,8 +132,7 @@ class GoLEngine:
             if return_trajectory:
                 traj.append(s.clone())
             elif self.skip_osci:
-                flat = s.view(N, -1).to(torch.int64)
-                hashes = board_hash(s, powers)
+                hashes = board_hash(s.float(), kernel)
                 mask = torch.isin(hashes, seen_hashes)
                 if mask.any():
                     # Oscillation detected
@@ -195,6 +203,8 @@ class GoLEngine:
         frames[0].save(filepath, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
 
     def save_initial_states_rle(self, board: Board, filepath: str):
+        if not isinstance(board, Board):
+            board = Board(torch.tensor(board))
         rles = board.rle_list()
         save_rle_list(rles, filepath)
 
@@ -203,14 +213,32 @@ class GoLEngine:
         arrs = [rle_decode_binary(s) for s in rles]
         return self.from_numpy_list(arrs)
 
-    def show(self, idx: int = 0, cmap: str = "gray", invert: bool = True, scale: int = 4):
+    def show(self, board: Union[Board, torch.Tensor] = None, idx: int = 0, cmap: str = "gray", invert: bool = True, scale: int = 4):
         """
         Show a single configuration (e.g. the initial state).
         idx: index of chain (ignored if only one board)
-        """
+        """        
         if plt is None:
             raise ImportError("matplotlib is required for visualization.")
-        state = self.state[idx].detach().cpu().numpy() if self.state.ndim == 3 else self.state.detach().cpu().numpy()
+        if board is None:
+            state = self.state[idx].detach().cpu().numpy() if self.state.ndim == 3 else self.state.detach().cpu().numpy()
+        else:
+            try:
+                if torch.is_tensor(board) :
+                    if board.dim() == 3:
+                        state = board[idx]
+                    else:
+                        state = board
+                elif isinstance(board, Board):
+                    if board._states.dim() == 3:
+                        state = board._states[idx]
+                    else:
+                        state = board._states
+                else:
+                    raise ValueError(f'Please pass either a board or a tensor in the function, not {type(board)}')
+            except:
+                raise ValueError(f'The Feature combination is not valid.')
+
         if invert:
             state = 1 - state
         if scale != 1:
