@@ -125,7 +125,7 @@ class ChangeRateScorer(Scorer):
 
         return rates
 
-# ---------- 4. EntropyScorer ----------
+# ---------- 4a. EntropyScorer ----------
 class EntropyScorer(Scorer):
     """
     Computes binary entropy of alive fraction per board.
@@ -154,6 +154,71 @@ class EntropyScorer(Scorer):
         alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
         ent = -(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac))
         return ent
+
+# ---------- 4b. ChaosScorer ----------
+class ChaosScorer(Scorer):
+    """
+    Estimates "chaoticity" of Game of Life boards.
+    Computes metrics over the last 50 generations after initial `steps`.
+
+    Args:
+        steps: Number of "warmup" generations to simulate
+        weight_entropy: weight for alive-fraction entropy
+        weight_growth: weight for bounding-box growth variance
+        weight_uniqueness: weight for temporal uniqueness
+    """
+    def __init__(self, engine, steps=5, weight_entropy=1.0, weight_growth=1.0, weight_uniqueness=1.0):
+        super().__init__(engine)
+        self.steps = steps
+        self.w_entropy = weight_entropy
+        self.w_growth = weight_growth
+        self.w_unique = weight_uniqueness
+        self.eval_steps = 50  # number of steps for scoring
+
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        if batch.device != self.engine.device:
+            batch = batch.to(self.engine.device)
+        batch = batch.float()
+
+        N, H, W = batch.shape
+        boards = batch.clone()
+
+        # --- Warmup ---
+        if self.steps > 0:
+            boards = self.engine.simulate(boards, steps=self.steps)
+        
+        boards = boards.tensor.to(torch.float)
+
+        # --- Evaluation over last 50 steps ---
+        entropies = []
+        bboxes = []
+        hashes = []
+
+        for _ in range(self.eval_steps):
+            alive_frac = boards.mean(dim=(1, 2))
+            alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
+            entropies.append(-(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac)))
+
+            mask = boards > 0.5
+            ys = mask.any(dim=2).float().sum(dim=1)
+            xs = mask.any(dim=1).float().sum(dim=1)
+            bboxes.append(ys * xs)
+
+            # simple hash for temporal uniqueness
+            hashes.append(torch.sum(boards * torch.arange(H*W, device=boards.device).float().view(1,H,W), dim=(1,2)))
+
+            boards = self.engine.simulate(boards).tensor.to(torch.float)
+
+        ent_score = torch.stack(entropies, dim=0).mean(dim=0)
+        growth_var = torch.stack(bboxes, dim=0).var(dim=0)
+        uniqueness_score = torch.stack(hashes, dim=0).std(dim=0)
+
+        total_score = (self.w_entropy * ent_score +
+                       self.w_growth * growth_var +
+                       self.w_unique * uniqueness_score)
+        return total_score
 
 
 # ---------- 5. DiversityScorer ----------
