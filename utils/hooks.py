@@ -44,23 +44,26 @@ def make_rle_saver(
 
         # --- Save boards ---
         for idx, (chain, score) in enumerate(zip(chains, scores)):
-            score_val = float(score.mean().item())
-            if score_threshold is not None and score_val < score_threshold:
-                continue  # skip uninteresting boards
+            batch_size = chain.board.tensor.shape[0]
+            for i in range(batch_size):
+                board = chain.board.tensor[i]
+                score_val = float(score.mean().item())
+                if score_threshold is not None and score_val < score_threshold:
+                    continue  # skip uninteresting boards
 
-            # Encode current board
-            rle_str = rle_encode_binary(chain.board.tensor[0].cpu(), rule=rule)
+                # Encode current board
+                rle_str = rle_encode_binary(board.cpu(), rule=rule)
 
-            # Make filename with timestamp, chain name, step & score
-            chain_name = getattr(chain.scorer, "name", f"chain{idx}")
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            fname = f"{chain_name}_step{t+1}_score{score_val:.3f}_{timestamp}.rle"
+                # Make filename with timestamp, chain name, step & score
+                chain_name = getattr(chain.scorer, "name", f"chain{idx}")
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                fname = f"{chain_name}_step{t+1}_score{score_val:.3f}_{timestamp}.rle"
 
-            # Write to file
-            with open(os.path.join(outdir, fname), "w") as f:
-                f.write(f"# Chain: {chain_name}\n")
-                f.write(f"# Step: {t+1}\n")
-                f.write(f"# Score: {score_val:.4f}\n")
-                f.write(rle_str + "\n")
+                # Write to file
+                with open(os.path.join(outdir, fname), "w") as f:
+                    f.write(f"# Chain: {chain_name}\n")
+                    f.write(f"# Step: {t+1}\n")
+                    f.write(f"# Score: {score_val:.4f}\n")
+                    f.write(rle_str + "\n")
 
     return hook
