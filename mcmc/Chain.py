@@ -4,6 +4,7 @@ try:
 except Exception as e:
     raise ImportError("This module requires PyTorch (torch). Install PyTorch and retry.") from e
 
+import math
 from core.Board import Board
 from core.Scorer import Scorer
 from core.Proposal import Proposal
@@ -100,7 +101,8 @@ class Chain:
                     # Damping factor: scales down as we approach max_steps
 
                     remaining = max(1, self.max_steps - self.scorer.steps)
-                    damping = (remaining / self.max_steps) ** 2
+                    damping = math.exp(- (self.scorer.steps / self.max_steps) * 2)
+
                     increment = int(min(raw_increment * damping, self.max_increment))
 
                     if increment > 0:
