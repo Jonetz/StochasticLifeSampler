@@ -147,3 +147,49 @@ class RotInvariantScorer:
             print(f"  Score: {scores[b].item()}")
 
         return scores
+
+# ---------- CombinedScorer ----------
+class CombinedScorer(Scorer):
+    """
+    Combines multiple child scorers with specified weights.
+
+    Args:
+        scorers: List of tuples (Scorer, weight).
+        normalize: If True, normalize weights to sum=1.
+        reduction: 'sum' or 'mean' for combining scores.
+
+    Methods:
+        score(batch): Returns weighted combination of child scores.
+
+    Safeguards:
+        - All scorers must return tensors of shape (N,)
+        - Normalizes weights if requested
+        - Works batch-wise on (N,H,W) tensors
+    """
+    def __init__(self, engine, scorers: list[tuple[Scorer, float]], normalize: bool = True, reduction: str = "sum"):
+        super().__init__(engine)
+        self.scorers = [s for s, _ in scorers]
+        weights = torch.tensor([w for _, w in scorers], dtype=torch.float32, device=engine.device)
+        if normalize:
+            weights = weights / weights.sum()
+        self.weights = weights
+        assert reduction in ("sum", "mean"), "reduction must be 'sum' or 'mean'"
+        self.reduction = reduction
+
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        if not batch.device == self.engine.device:
+            batch = batch.to(self.engine.device)
+
+        scores = []
+        for scorer in self.scorers:
+            scores.append(scorer.score(batch))  # (N,)
+        scores = torch.stack(scores, dim=1)  # (N, num_scorers)
+
+        weighted = scores * self.weights.view(1, -1)
+
+        if self.reduction == "sum":
+            return weighted.sum(dim=1)  # (N,)
+        else:  # mean
+            return weighted.mean(dim=1)  # (N,)
