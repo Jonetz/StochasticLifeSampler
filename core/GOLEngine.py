@@ -1,17 +1,21 @@
 
 import os
+import shutil
+import subprocess
 import sys
 
 # Add the root project directory to the system path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import tempfile
 from typing import Any, Callable, Optional, Tuple, List, Union, Sequence
 import numpy as np
 from core.Board import Board
 from utils.encodings import board_hash, save_rle_list, load_rle_list, rle_decode_binary
-from PIL import Image
+from PIL import Image, ImageDraw
 import collections
-
+import imageio.v3 as iio
+import numpy as np
 
 """
 gol_engine.py
@@ -364,7 +368,9 @@ class GoLEngine:
                         filepath: str,
                         fps: int = 10,
                         scale: int = 4,
-                        invert: bool = True):
+                        invert: bool = True,
+                        show_progress: bool = True,
+                        show_counter: bool = True):
         """
         Save a trajectory of boards to an animated GIF.
 
@@ -374,19 +380,25 @@ class GoLEngine:
             fps: Frames per second for GIF playback.
             scale: Upscaling factor for visibility.
             invert: If True, invert colors (alive=white).
+            show_progress: If True, draws a small progress bar at bottom of frames.
+            show_counter: If True, adds frame number (every 100 frames).
 
         Returns:
             None
-
-        Safeguards:
-            - Converts tensors to CPU numpy arrays.
-            - Checks dimensions and raises ValueError for unsupported shapes.
-            - Ensures grayscale ('L') mode.
         """
+        def _find_ffmpeg():
+            """Return ffmpeg executable path if available, else None."""
+            for exe in ["ffmpeg", "ffmpeg.exe"]:
+                path = shutil.which(exe)
+                if path is not None:
+                    return path
+            return None
         if torch.is_tensor(trajectory):
             trajectory = [trajectory[i] for i in range(trajectory.shape[0])]
+        total_frames = len(trajectory)
+
         frames = []
-        for t in trajectory:
+        for idx, t in enumerate(trajectory):
             # convert to numpy 2D array
             if isinstance(t, torch.Tensor):
                 if t.ndim == 3:
@@ -407,12 +419,66 @@ class GoLEngine:
             # convert to uint8 0-255
             arr_uint8 = (arr * 255).astype(np.uint8)
             # create PIL Image in 'L' mode (grayscale)
-            img = Image.fromarray(arr_uint8, mode='L')
+            img = Image.fromarray(arr_uint8, mode='L').convert("RGB")  # convert to RGB for drawing
+            draw = ImageDraw.Draw(img)
+
+            # draw progress bar
+            if show_progress:
+                bar_height = 6
+                bar_width = img.width
+                progress = int(bar_width * (idx + 1) / total_frames)
+                draw.rectangle([0, img.height - bar_height, progress, img.height], fill=(255, 0, 0))
+
+            # draw counter (here every frame, adjust if needed)
+            if show_counter and idx % 100 == 0:
+                text = f"{idx}/{total_frames}"
+                draw.text((5, 5), text, fill=(255, 0, 0))
+
             frames.append(img)
 
         # duration per frame in ms
         duration_ms = int(1000 / fps)
-        frames[0].save(filepath, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
+
+        # check if ffmpeg is available
+        ffmpeg_path = _find_ffmpeg()
+        if ffmpeg_path is not None:
+            tmpdir = tempfile.mkdtemp()
+            print(tmpdir)
+            try:
+                # save frames to tmp PNGs
+                for i, frame in enumerate(frames):
+                    arr_uint8 = np.array(frame)
+                    iio.imwrite(f"{tmpdir}/frame_{i:05d}.png", arr_uint8)
+
+                # generate palette for better colors
+                palette_path = os.path.join(tmpdir, "palette.png")
+                cmd1 = [
+                    "ffmpeg", "-y", "-framerate", str(fps),
+                    "-i", os.path.join(tmpdir, "frame_%05d.png"),
+                    "-vf", "palettegen", palette_path
+                ]
+                subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # use palette to create final gif
+                cmd2 = [
+                    "ffmpeg", "-y", "-framerate", str(fps),
+                    "-i", os.path.join(tmpdir, "frame_%05d.png"),
+                    "-i", palette_path,
+                    "-lavfi", "paletteuse",
+                    filepath
+                ]
+                subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            finally:
+                shutil.rmtree(tmpdir)  # cleanup
+        else:
+            # fallback: slow Pillow method
+            frames[0].save(filepath,
+                        save_all=True,
+                        append_images=frames[1:],
+                        duration=duration_ms,
+                        loop=0,
+                        optimize=False,
+                        disposal=2)
 
     def save_initial_states_rle(self, board: Board, filepath: str):
         """
