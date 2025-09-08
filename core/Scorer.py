@@ -1,8 +1,5 @@
-from typing import Union
-import numpy as np
+from typing import Optional, Union
 import torch
-from scipy.stats import entropy
-from itertools import combinations
 import hashlib
 
 from core.Board import Board
@@ -11,13 +8,51 @@ from core.GOLEngine import GoLEngine
 DEBUG = False
 # ---------- SCORERS ----------
 class Scorer:
-    """Base class for evaluating interestingness."""
-    def score(self, batch: Union[Board, torch.Tensor]) -> float:
+    """
+    Base class for evaluating board interestingness in a batch.
+
+    Args:
+        engine: GoLEngine instance used for simulation.
+        steps: Number of simulation steps for scoring (optional).
+
+    Attributes:
+        name: Name of the scorer class for identification.
+    """
+    def __init__(self, engine: GoLEngine, steps: Optional[int] = 100):
+        self.engine = engine
+        self.steps = steps
+        self.name = self.__class__.__name__ 
+
+    def score(self,batch: Union[Board, torch.Tensor]):
+        """
+        Compute score for a batch of boards.
+
+        Args:
+            batch: Board or tensor of shape (N,H,W).
+
+        Returns:
+            Tensor of scores, shape (N,).
+
+        Safeguards:
+            Must be implemented in subclass.
+        """
         raise NotImplementedError
 
 # ---------- 1. AliveCellCountScorer ----------
 class AliveCellCountScorer(Scorer):
-    """Batchified: returns fraction of alive cells per board in the batch."""
+    """
+    Returns fraction of alive cells per board after simulation.
+
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) with fractions in [0,1].
+
+    Safeguards:
+        - Converts input to float.
+        - Runs simulation on engine before counting.
+    """
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         """
         batch: (N, H, W) tensor, dtype=uint8 or bool
@@ -26,17 +61,25 @@ class AliveCellCountScorer(Scorer):
         if not torch.is_tensor(batch):
             batch = batch.tensor
         batch = batch.float()
-        alive_frac = batch.sum(dim=(1, 2)) / (batch.shape[1] * batch.shape[2])
-        return alive_frac.cpu()
-
+        batch = self.engine.simulate(batch, steps=self.steps)
+        alive_frac = batch._states.sum(dim=(1, 2)) / (batch._states.shape[1] * batch._states.shape[2])
+        return alive_frac
+    
 # ---------- 2. StabilityScorer ----------
 class StabilityScorer(Scorer):
-    """Rewards temporal stability: fraction of unchanged cells per step."""
-    def __init__(self, engine: GoLEngine, steps: int = 10):
-        super().__init__()
-        self.engine = engine
-        self.steps = steps
+    """
+    Rewards temporal stability: fraction of unchanged cells across steps.
 
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) giving mean fraction of unchanged cells per board.
+
+    Safeguards:
+        - Uses engine.simulate with return_trajectory=True.
+        - Converts input to proper device and dtype.
+    """
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         """
         batch: list of initial board tensors (N, H, W)
@@ -51,35 +94,52 @@ class StabilityScorer(Scorer):
         traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
         diffs = (traj_t[1:] == traj_t[:-1]).float()  # (T-1, N, H, W)
         sims = diffs.mean(dim=(0,2,3))  # mean over time + spatial dims → per board
-        return sims.cpu()
+        return sims
 
 # ---------- 3. ChangeRateScorer ----------
 class ChangeRateScorer(Scorer):
-    """Rewards temporal variability: fraction of changed cells per step."""
-    def __init__(self, engine: GoLEngine, steps: int = 10):
-        super().__init__()
-        self.engine = engine
-        self.steps = steps
+    """
+    Rewards temporal variability: fraction of cells that changed state.
 
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) with fraction of changed cells per board.
+
+    Safeguards:
+        - Ensures tensors are on correct device.
+        - Computes element-wise difference correctly for batch.
+    """
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         if not torch.is_tensor(batch):
             batch = batch.tensor
         if not batch.device == self.engine.device:
-            batch = batch.to(self.engine.device)
-        _, traj = self.engine.simulate(batch, steps=self.steps, return_trajectory=True)
-        traj_t = torch.stack(traj, dim=0)  # (T, N, H, W)
-        flips = (traj_t[1:] != traj_t[:-1]).float()
-        rates = flips.mean(dim=(0,2,3))
-        return rates.cpu()
+            batch = batch.to(self.engine.device)        
+        batch = self.engine.simulate(batch, steps=self.steps)
+        batch_x = self.engine.simulate(batch)    
+        # Compute elementwise difference
+        diff = batch._states != torch.tensor(batch_x._states)
+        # Fraction of changed cells per board
+        rates = diff.to(torch.float32).view(diff.shape[0], -1).sum(dim=1)
+
+        return rates
 
 # ---------- 4. EntropyScorer ----------
 class EntropyScorer(Scorer):
-    """Batchified: entropy per board, dim 0 is batch dimension."""
-    def __init__(self, engine: GoLEngine, steps: int = 10):
-        super().__init__()
-        self.engine = engine
-        self.steps = steps
+    """
+    Computes binary entropy of alive fraction per board.
 
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) with entropy values.
+
+    Safeguards:
+        - Clamps alive fraction to avoid log(0).
+        - Works batch-wise on (N,H,W) tensors.
+    """
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         """
         batch: (N, H, W) tensor, dtype=uint8 or bool
@@ -93,12 +153,24 @@ class EntropyScorer(Scorer):
         alive_frac = batch.mean(dim=(1, 2))  # fraction of alive cells per board
         alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
         ent = -(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac))
-        return ent.cpu()
+        return ent
 
 
 # ---------- 5. DiversityScorer ----------
 class DiversityScorer(Scorer):
-    """Batchified diversity proxy: alive fraction * (1-alive fraction) per board."""
+    """
+    Computes diversity proxy: alive fraction * (1-alive fraction).
+
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) with diversity scores.
+
+    Safeguards:
+        - Converts tensor to float.
+        - Returns CPU tensor.
+    """
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         """
         batch: (N, H, W) tensor
@@ -124,12 +196,25 @@ class DiversityScorer(Scorer):
 
 # ---------- 7. OscillationScorer ----------
 class OscillationScorer(Scorer):
-    """Detect first repeating state as oscillation period."""
-    def __init__(self, engine: GoLEngine, steps: int = 100):
-        super().__init__()
-        self.engine = engine
-        self.steps = steps
+    """
+    Detects first repeating board configuration to estimate oscillation period.
 
+    Methods:
+        _hash_board: Stable hash of a single board.
+        score: Returns oscillation period per board.
+
+    Args:
+        batch: Board or tensor (N,H,W).
+
+    Returns:
+        Tensor of shape (N,) with oscillation periods (0 if no repeat).
+
+    Safeguards:
+        - Uses hashlib.sha1 for stable hashing.
+        - Temporarily sets engine step_fn for hashing.
+        - Restores step_fn after scoring.
+        - DEBUG flag prints warning if no repeat found.
+    """
     def _hash_board(self, board: torch.Tensor) -> str:
         """
         Stable hash of a single board state.
@@ -143,25 +228,28 @@ class OscillationScorer(Scorer):
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         if not torch.is_tensor(batch):
             batch = batch.tensor
-        _, traj = self.engine.simulate(batch, steps=self.steps, return_trajectory=True)
-        traj_t = [b.clone() for b in traj]  # list of (N,H,W)
         N = batch.shape[0]
-        periods = torch.zeros(N, device=self.engine.device)
+        periods = torch.zeros(N, device=self.engine.device)        
+        self.engine.set_step_fn(
+            lambda s, t: [
+                hashlib.sha1(b.cpu().numpy().tobytes()).hexdigest()
+                for b in s  # batch of boards
+            ]
+        )
+        _, traj = self.engine.simulate(batch, steps=self.steps)
+
+        self.engine.set_step_fn(None)
 
         for n in range(N):
             seen = {}
-            for t in range(len(traj_t)):
-                h = self._hash_board(traj_t[t][n])
+            for t, hashes in enumerate(traj):
+                h = hashes[n]
                 if h in seen:
                     periods[n] = t - seen[h]
-                    if DEBUG:
-                        print(f"[Board {n}] Repeat found at step {t}, "
-                              f"period = {periods[n].item()}, "
-                              f"first seen at step {seen[h]}")
                     break
                 seen[h] = t
 
             if DEBUG and periods[n] == 0:
                 print(f"[Board {n}] No repeat found within {self.steps} steps")
 
-        return periods.cpu()
+        return periods

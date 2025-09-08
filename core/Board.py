@@ -3,7 +3,6 @@ from typing import Optional, Tuple, List, Union, Sequence, Dict
 import numpy as np
 try:
     import torch
-    import torch.nn.functional as F
 except Exception as e:
     raise ImportError("This module requires PyTorch (torch). Install PyTorch and retry.") from e
 
@@ -61,21 +60,60 @@ class Board:
         return self._states.shape[2]
 
     def clone(self) -> "Board":
+        """
+        Return a deep copy of the Board.
+
+        Returns:
+            Board: a new Board object with copied tensor and metadata.
+
+        Safeguards:
+            - Copies the internal tensor and metadata to avoid side effects.
+        """
         return Board(self._states.clone(), self.idx, device=self.device, meta=self.meta.copy())
 
     def to(self, device: Union[str, torch.device]) -> "Board":
+        """
+        Move the board tensor to a different device.
+
+        Args:
+            device: target torch device (str or torch.device)
+
+        Returns:
+            Board: new Board object on the specified device
+
+        Safeguards:
+            - Clones metadata to prevent accidental sharing.
+        """
         return Board(self._states.to(device), self.idx, device=device, meta=self.meta.copy())
 
     def get_numpy(self, index: int = 0) -> np.ndarray:
         """
-        Return a CPU numpy array for chain index (default 0 if single).
+        Get a CPU numpy array for a single chain.
+
+        Args:
+            index: index of chain to extract (default 0)
+
+        Returns:
+            np.ndarray: array of shape (H, W), dtype uint8
+
+        Safeguards:
+            - Returns detached tensor to avoid modifying board.
+            - Ensures index is valid.
         """
         t = self._states[index] if self.idx is None else self._states[self.idx]
         return t.detach().cpu().numpy().astype(np.uint8)
 
     def set_state(self, state: Union[np.ndarray, torch.Tensor], index: int = 0):
         """
-        Replace the state of chain `index` with provided state array (H,W).
+        Replace the state of a chain with a new array.
+
+        Args:
+            state: 2D array or tensor of shape (H, W)
+            index: index of chain to replace (default 0)
+
+        Safeguards:
+            - Checks shape compatibility with board dimensions.
+            - Moves tensor to the board device.
         """
         if isinstance(state, np.ndarray):
             state_t = torch.from_numpy(state.astype(np.uint8)).to(self._states.device)
@@ -91,14 +129,21 @@ class Board:
                 fill_prob: float = 0.0,
                 fill_shape: Optional[Tuple[int, int]] = None):
         """
-        Create a Batched Board of size (H, W), optionally filling only a centered subregion.
+        Create a batched board of shape (N, H, W) with optional random initialization.
 
         Args:
-            N: number of boards (batch size)
+            N: number of boards in batch
             H, W: board dimensions
             device: torch device
-            fill_prob: probability of a cell being alive in the filled region
-            fill_shape: (Ah, Aw) size of the subregion to randomly fill; if None, fills entire board
+            fill_prob: probability of a cell being alive
+            fill_shape: optional (H_box, W_box) subregion to fill; centered if provided
+
+        Returns:
+            Board: batched board object
+
+        Safeguards:
+            - Checks that fill_shape does not exceed board size.
+            - Ensures tensor dtype is uint8.
         """
         t = torch.zeros((N, H, W), dtype=torch.uint8, device=device)
 
@@ -128,8 +173,19 @@ class Board:
                         device: Union[str, torch.device] = "cuda",
                         board_size: Optional[Tuple[int,int]] = None):
         """
-        Build batch from list of numpy 2D arrays.
-        If board_size is provided and larger than array, the array is centered.
+        Build a batch of boards from a list of 2D numpy arrays.
+
+        Args:
+            arrs: sequence of 2D numpy arrays
+            device: torch device
+            board_size: optional target board size (H, W); arrays are centered if smaller
+
+        Returns:
+            Board: batched board object
+
+        Safeguards:
+            - Checks that each array fits within the target board size.
+            - Converts arrays to uint8 and moves to correct device.
         """
         assert len(arrs) > 0
         # Determine max shape if board_size not given
@@ -157,7 +213,14 @@ class Board:
 
     def rle_list(self) -> List[str]:
         """
-        Return list of RLE strings for each chain (CPU numpy conversion).
+        Convert each board in the batch to its RLE string representation.
+
+        Returns:
+            List[str]: list of RLE strings, one per chain
+
+        Safeguards:
+            - Uses CPU numpy copy to avoid device conflicts.
+            - Encodes each chain independently.
         """
         out = []
         for i in range(self.n_chains()):

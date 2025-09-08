@@ -1,14 +1,25 @@
 import torch
 from abc import abstractmethod
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from .Board import Board
 
 class Proposal():
     """
-    Base class for all proposal distributions.
+    Base class for all proposal distributions in MCMC/board updates.
+
+    Args:
+        name: Optional name for the proposal.
+        box_size: Optional bounding box (H_box, W_box) restricting proposals.
+        device: Device to perform operations on (defaults to 'cuda' if available).
+
+    Methods:
+        propose(board): Abstract method to generate a proposed board state.
+
+    Safeguards:
+        - Subclasses must implement `propose`.
     """
-    def __init__(self, engine, name: Optional[str] = None, box_size: Optional[Tuple[int,int]] = None):
-        self.engine = engine
+    def __init__(self, name: Optional[str] = None, box_size: Optional[Tuple[int,int]] = None, device: Optional[str] = None):        
+        self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'cpu'
         self.box_size = box_size  # (H_box, W_box)
         self.name = name or self.__class__.__name__
 
@@ -21,20 +32,30 @@ class Proposal():
 
 class CombinedProposal(Proposal):
     """
-    Combines multiple proposal strategies with given probabilities.
-    Each step, one of the child proposals is chosen according to the weights.
+    Combines multiple child proposals with specified probabilities.
+
+    Each step, one child proposal is selected independently for each board
+    according to its weight.
+
+    Args:
+        proposals: List of tuples (Proposal, weight).
+        name: Optional name for the combined proposal.
+        box_size: Optional bounding box to pass to child proposals.
+
+    Methods:
+        propose(board): Applies sampled proposal to each board in batch.
+
+    Safeguards:
+        - Normalizes weights to sum to 1.
+        - Clones input board to avoid in-place modification.
+        - Ensures proper indexing of batch and proposal.
     """
-    def __init__(self, engine, proposals: list[tuple[Proposal, float]], name: Optional[str] = None, box_size: Optional[Tuple[int,int]] = None):
-        super().__init__(engine, name)
+    def __init__(self, proposals: list[tuple[Proposal, float]], name: Optional[str] = None, box_size: Optional[Tuple[int,int]] = None):
+        super().__init__(name)
         self.proposals = [p for p, _ in proposals]
         weights = torch.tensor([w for _, w in proposals if not w <= 0], dtype=torch.float32)
         self.probs = weights / weights.sum()  # normalize to sum=1
         self.box_size = box_size
-
-        # Assign box_size to child proposals if they support it
-        for p in self.proposals:
-            if hasattr(p, 'box_size'):
-                p.box_size = box_size
 
     
     def propose(self, board: Board) -> Board:
@@ -55,13 +76,27 @@ class CombinedProposal(Proposal):
 
 class SingleFlipProposal(Proposal):
     """
-    Flip a single random cell.
-    Vectorized: optionally restricted to active boundary and/or central box.
-    """
-    def __init__(self, engine, use_activity_boundary: bool = False, box_size: Optional[Tuple[int,int]] = None):
-        super().__init__(engine, box_size=box_size)
-        self.use_activity_boundary = use_activity_boundary
+    Propose a new board by flipping a single random cell.
 
+    Supports optional restriction to a central bounding box or
+    to an activity boundary (cells that are changing).
+
+    Args:
+        use_activity_boundary: If True, only flip cells that are active.
+        box_size: Optional central box (H_box, W_box) to restrict flips.
+
+    Methods:
+        propose(board): Returns a new board with one flipped cell per batch.
+
+    Safeguards:
+        - Uses uniform sampling if activity boundary not implemented.
+        - Ensures indices are within bounds.
+        - Clones the board to prevent modifying input.
+        - Raises NotImplementedError if use_activity_boundary=True.
+    """
+    def __init__(self, use_activity_boundary=False, box_size=None):
+        super().__init__(box_size=box_size)
+        self.use_activity_boundary = use_activity_boundary
     def propose(self, board: Board) -> Board:
         b = board.clone()
         N, H, W = b.shape
@@ -88,7 +123,6 @@ class SingleFlipProposal(Proposal):
             box_mask[start_i:end_i, start_j:end_j] = 1
             activity_mask &= box_mask.unsqueeze(0)  # broadcast to (N,H,W)
 
-            print(activity_mask)
             # Fallback for empty activity# Flatten H and W dimensions
             no_activity = ~activity_mask.any(dim=1)  # (N,)
 
@@ -120,10 +154,26 @@ class SingleFlipProposal(Proposal):
 
 class BlockFlipProposal(Proposal):
     """
-    Flip a 2x2 block inside a bounding box in the middle of the board.
+    Flip a 2x2 block of cells inside an optional central bounding box.
+
+    Args:
+        box_size: Optional central box (H_box, W_box) to restrict where blocks
+                  are chosen. Must be large enough to fit 2x2 block.
+        name: Optional name for the proposal.
+
+    Methods:
+        propose(board): Returns a new board with one 2x2 block flipped.
+
+    Safeguards:
+        - Raises ValueError if box_size is None.
+        - Ensures block indices are within bounds (avoids overflow).
+        - Clones the board to prevent modifying input.
     """
-    def __init__(self, engine, box_size: Optional[Tuple[int,int]] = None, name: Optional[str] = None):
-        super().__init__(engine, name, box_size=box_size)
+    def __init__(self, box_size: Optional[Tuple[int,int]] = None, name: Optional[str] = None):
+        super().__init__(name, box_size=box_size)
+        if box_size is None:
+            raise ValueError('None')
+        
 
     def propose(self, board: Board) -> Board:
         b = board.clone()

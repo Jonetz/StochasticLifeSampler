@@ -1,9 +1,9 @@
 from typing import Optional, Tuple
-import numpy as np
 import torch
 from core import Board
 from core.Proposal import Proposal
 from utils.encodings import load_rle_files
+from utils.neural_proposals import PatchNet
 
 # Pattern Proposal
 
@@ -17,7 +17,6 @@ class PatternInsertProposal(Proposal):
     """
 
     def __init__(self,
-                 engine,
                  rle_folder: str,
                  max_files: Optional[int] = None,
                  name: Optional[str] = None,
@@ -29,56 +28,56 @@ class PatternInsertProposal(Proposal):
         max_files: limit number of patterns to load
         box_size: optional (H_box, W_box) for placement; if None uses full board during propose
         target_shape: optional target shape used when decoding RLEs (if loader supports it)
-        device: torch device to store patterns (defaults to engine.device)
+        device: torch device to store patterns
         """
-        super().__init__(engine, name=name, box_size=box_size)
+        super().__init__(name=name, box_size=box_size, device=device)
         self.rle_folder = rle_folder
         self.max_files = max_files
-        self.device = torch.device(device) if device is not None else engine.device
         self.target_shape = target_shape
         # Load patterns (numpy arrays) using your loader function
-        arrs, _, _, names = load_rle_files(rle_folder, max_files=max_files, target_shape=target_shape or (200,200))
+        arrs, names = load_rle_files(rle_folder, max_files=max_files, target_shape=target_shape or (200,200))
         if len(arrs) == 0:
             raise RuntimeError(f"No patterns loaded from {rle_folder}")
 
         # Convert arrays into tight-bbox patterns and compute sizes
         self.names = names
-        patterns = []   # list of small numpy masks
-        sizes = []
+        patterns, sizes_h, sizes_w = [], [], []
         for a in arrs:
-            # a is 2D numpy binary array
-            if not np.any(a):
-                # skip empty
+            if a is None or not a.any():
                 continue
-            rows = np.any(a, axis=1)
-            cols = np.any(a, axis=0)
-            rmin, rmax = np.where(rows)[0][0], np.where(rows)[0][-1]
-            cmin, cmax = np.where(cols)[0][0], np.where(cols)[0][-1]
-            small = a[rmin:rmax+1, cmin:cmax+1].astype(np.uint8)
-            patterns.append(small)
-            sizes.append(small.shape)
+
+            # compute tight bounding box
+            rows = a.any(dim=1)
+            cols = a.any(dim=0)
+            r_indices = torch.where(rows)[0]
+            c_indices = torch.where(cols)[0]
+            rmin, rmax = r_indices[0].item(), r_indices[-1].item()
+            cmin, cmax = c_indices[0].item(), c_indices[-1].item()
+
+            trimmed = a[rmin:rmax+1, cmin:cmax+1].to(torch.uint8)
+            patterns.append(trimmed)
+            sizes_h.append(trimmed.shape[0])
+            sizes_w.append(trimmed.shape[1])
 
         if len(patterns) == 0:
             raise RuntimeError("No non-empty patterns found in folder")
 
-        # compute max patch size
+        # max dimensions
         self.P = len(patterns)
-        self.sizes = sizes  # list of (h,w)
-        self.max_h = max(s[0] for s in sizes)
-        self.max_w = max(s[1] for s in sizes)
+        self.max_h = max(sizes_h)
+        self.max_w = max(sizes_w)
 
-        # create padded patterns tensor (P, max_h, max_w) on device
-        pat_tensor = torch.zeros((self.P, self.max_h, self.max_w), dtype=torch.uint8)
+        # padded tensor (P, max_h, max_w)
+        pat_tensor = torch.zeros((self.P, self.max_h, self.max_w), dtype=torch.uint8, device=self.device)
         for idx, pat in enumerate(patterns):
             h, w = pat.shape
-            pat_tensor[idx, :h, :w] = torch.from_numpy(pat)
+            pat_tensor[idx, :h, :w] = pat  # already tensor
 
-        self.patterns_padded = pat_tensor.to(self.device)  # uint8 (P, max_h, max_w)
-        # Also store sizes as tensors for quick indexing on device
-        hs = torch.tensor([s[0] for s in sizes], dtype=torch.long, device=self.device)
-        ws = torch.tensor([s[1] for s in sizes], dtype=torch.long, device=self.device)
-        self.sizes_h = hs
-        self.sizes_w = ws
+        self.patterns_padded = pat_tensor
+
+        # sizes as tensors on device
+        self.sizes_h = torch.tensor(sizes_h, dtype=torch.long, device=self.device)
+        self.sizes_w = torch.tensor(sizes_w, dtype=torch.long, device=self.device)
 
     def propose(self, board: Board) -> Board:
         """
@@ -144,4 +143,128 @@ class PatternInsertProposal(Proposal):
 
         return b
     
+class AreaTransformProposal(Proposal):
+    """
+    Randomly selects a sub-area inside the bounding box and applies a random
+    spatial transformation (flip or rotation).
+    """
+    def __init__(self, 
+                 box_size: Optional[Tuple[int,int]] = None,
+                 min_patch: int = 4,
+                 max_patch: int = 20,
+                 name: Optional[str] = None,):
+        super().__init__(name, box_size=box_size)
+        self.min_patch = min_patch
+        self.max_patch = max_patch
+
+    def propose(self, board: Board) -> Board:
+        b = board.clone()
+        N, H, W = b.shape
+
+        # Define bounding box (defaults to full board)
+        if self.box_size:
+            Ah, Aw = self.box_size
+            h_start = (H - Ah) // 2
+            w_start = (W - Aw) // 2
+            h_end = h_start + Ah
+            w_end = w_start + Aw
+        else:
+            h_start, h_end = 0, H
+            w_start, w_end = 0, W
+
+        # Random board index
+        idx = torch.randint(0, N, (1,)).item()
+
+        # Choose random transform
+        op = torch.randint(0, 5, (1,)).item()
+        if op < 3:
+            p = torch.randint(self.min_patch, self.max_patch + 1, (1,)).item()
+            ph = pw = p
+        else:
+            # Random patch size
+            ph = torch.randint(self.min_patch, self.max_patch + 1, (1,)).item()
+            pw = torch.randint(self.min_patch, self.max_patch + 1, (1,)).item()
+
+        # Random position (ensure patch fits inside bounding box)
+        i = torch.randint(h_start, max(h_start+1, h_end - ph + 1), (1,)).item()
+        j = torch.randint(w_start, max(w_start+1, w_end - pw + 1), (1,)).item()
+
+        # Extract patch
+        patch = b._states[idx, i:i+ph, j:j+pw]
+
+        if op == 0:
+            patch_new = torch.rot90(patch, 1, [0,1])   # 90°
+        elif op == 1:
+            patch_new = torch.rot90(patch, 2, [0,1])   # 180°
+        elif op == 2:
+            patch_new = torch.rot90(patch, 3, [0,1])   # 270°
+        elif op == 3:
+            patch_new = torch.flip(patch, [0])         # vertical flip
+        elif op == 4:
+            patch_new = torch.flip(patch, [1])         # horizontal flip
+
+        # Write back
+        b._states[idx, i:i+ph, j:j+pw] = patch_new
+
+        return b
+
+    
 # Neural Network proposal
+class PatchNetProposal(Proposal):
+    """
+    Uses trained model to a fill in a specific part of the patch net.
+    """
+    def __init__(self, 
+                 filepath: str = f'data\network_final.pth',
+                 box_size: Optional[Tuple[int,int]] = None,
+                 env_size: int = 12,
+                 patch_size: int = 3,
+                 name: Optional[str] = None,
+                 device: Optional[str] = None):
+        super().__init__(name, box_size=box_size, device=device)
+        self.env_size = env_size
+        self.patch_size = patch_size
+        weights = torch.load(filepath)
+        self.network = PatchNet(env_size=env_size, patch_size=patch_size, dropout=0)
+        self.network.load_state_dict(weights)
+        self.network.eval()  # important for inference
+        self.network.to(self.device)                
+    
+    def propose(self, board: Board) -> Board:
+        b = board.clone()
+        N, H, W = b.shape
+
+        # Bounding box
+        if self.box_size:
+            Ah, Aw = self.box_size
+            h_start = (H - Ah) // 2
+            w_start = (W - Aw) // 2
+            h_end = h_start + Ah - self.env_size
+            w_end = w_start + Aw - self.env_size
+        else:
+            h_start, h_end = 0, H - self.env_size
+            w_start, w_end = 0, W - self.env_size
+
+        if self.env_size > (h_end - h_start) or self.env_size > (w_end - w_start):
+            raise ValueError("Max pattern size larger than placement box.")
+
+        # Random position inside bounding box
+        i = torch.randint(h_start, h_end, (1,)).item()
+        j = torch.randint(w_start, w_end, (1,)).item()
+
+        # Extract environment patch
+        env = b._states[:, i:i+self.env_size, j:j+self.env_size].to(self.device)
+        env = env.unsqueeze(1).float()  # [N, 1, env_size, env_size]
+
+        # Predict patch
+        prop = self.network(env)  # [N, patch_size, patch_size]
+
+        # Insert predicted patch into board (centered)
+        center_i = self.env_size // 2 - self.patch_size // 2
+        center_j = self.env_size // 2 - self.patch_size // 2
+        h_insert = i + center_i
+        w_insert = j + center_j
+
+        b._states[:, h_insert:h_insert+self.patch_size, w_insert:w_insert+self.patch_size] = prop
+
+        return b

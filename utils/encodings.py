@@ -1,13 +1,20 @@
+from functools import partial
 import json
 import os
 import re
+import concurrent
 import numpy as np
-from typing import Optional, Sequence, List, Union, Tuple
-import torch.nn.functional as F
+from typing import Sequence, List, Union, Tuple
+try:
+    import torch
+    import torch.nn.functional as F
+except Exception as e:
+    raise ImportError("This module requires PyTorch (torch). Install PyTorch and retry.") from e
 
-import torch
-
-_HEADER_RE = re.compile(r"x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)", re.IGNORECASE)
+_HEADER_RE = re.compile(
+    r"x\s*=\s*(\d+)\s*,\s*y\s*=\s*(\d+)(?:\s*,\s*rule\s*=\s*([BbSs0-9/]+))?",
+    re.IGNORECASE,
+)
 _TOKENS_RE = re.compile(r"(\d*)([bo\$xyz!])", re.IGNORECASE)
 
 # ---------------------------
@@ -24,36 +31,51 @@ def rle_encode_binary(grid: torch.Tensor, rule: str = None) -> str:
     if grid.ndim == 3 and grid.shape[0] in [0,1]:
         grid = grid.squeeze(0)
     assert grid.ndim == 2, "Expected 2D tensor"
+
+    # --- Trim empty borders ---
+    nonzero = grid.nonzero(as_tuple=False)
+    if nonzero.numel() == 0:
+        # No live cells → return 1x1 empty board
+        return f"x = 1, y = 1{', rule = ' + rule if rule else ''}\nb!"
+    ymin, xmin = nonzero.min(0).values.tolist()
+    ymax, xmax = nonzero.max(0).values.tolist()
+    grid = grid[ymin:ymax+1, xmin:xmax+1]
+
     H, W = grid.shape
-    parts = [f"x = {W}, y = {H}" + (f", rule = {rule}" if rule else ""), ]
+    header = f"x = {W}, y = {H}" + (f", rule = {rule}" if rule else "")
 
-    # Flatten row-major
-    flat = grid.flatten().to(torch.uint8).cpu().numpy()
-    runs = []
-    cur = flat[0]
-    cnt = 1
-    for v in flat[1:]:
-        v = int(v)
-        if v == cur:
-            cnt += 1
-        else:
-            char = 'o' if cur == 1 else 'b'
-            runs.append(f"{cnt if cnt != 1 else ''}{char}")
-            cur = v
-            cnt = 1
-    # last run
-    char = 'o' if cur == 1 else 'b'
-    runs.append(f"{cnt if cnt != 1 else ''}{char}")
 
-    # Insert line breaks as needed, but simple implementation:
-    body = "".join(runs) + "!"
-    return "\n".join(parts) + "\n" + body
+    rows_rle = []
+    for y in range(H):
+        row = grid[y].to(torch.uint8).cpu().numpy()
+        runs = []
+        cur = row[0]
+        cnt = 1
+        for v in row[1:]:
+            v = int(v)
+            if v == cur:
+                cnt += 1
+            else:
+                char = 'o' if cur == 1 else 'b'
+                runs.append(f"{cnt if cnt > 1 else ''}{char}")
+                cur = v
+                cnt = 1
+        # last run in row
+        char = 'o' if cur == 1 else 'b'
+        runs.append(f"{cnt if cnt > 1 else ''}{char}")
+        rows_rle.append("".join(runs))
+
+    # Join rows with $, and terminate with !
+    body = "$".join(rows_rle) + "!"
+
+    return header + "\n" + body
 
 def rle_decode_binary(rle_str: str, device: Union[str, torch.device] = "cpu", target_shape: Tuple[int, int] = None) -> torch.Tensor:
     """
     Decode official Life RLE string into a torch tensor (H x W) binary.
     """
-    lines = [ln.strip() for ln in rle_str.splitlines() if not ln.strip().startswith("#")]
+    # remove comment lines
+    lines = [ln.strip() for ln in rle_str.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     header = None
     for ln in lines:
         if _HEADER_RE.search(ln):
@@ -63,11 +85,10 @@ def rle_decode_binary(rle_str: str, device: Union[str, torch.device] = "cpu", ta
         raise ValueError("Missing RLE header (x = ..., y = ...)")
     m = _HEADER_RE.search(header)
     W, H = int(m.group(1)), int(m.group(2))
-
     # Body: everything after header line
     idx = lines.index(header)
     body = "".join(lines[idx + 1:])
-    tensor = torch.zeros((H, W), dtype=torch.uint8, device=device)
+    tensor = torch.zeros((H, W), dtype=torch.bool, device=device)
 
     x = y = 0
     for count_str, tag in _TOKENS_RE.findall(body):
@@ -78,7 +99,7 @@ def rle_decode_binary(rle_str: str, device: Union[str, torch.device] = "cpu", ta
         elif tag in ('o', 'x', 'y', 'z'):  # treat multi-state as alive
             for i in range(count):
                 if 0 <= y < H and 0 <= x < W:
-                    tensor[y, x] = 1
+                    tensor[y, x] = True                
                 x += 1
         elif tag == '$':
             y += count
@@ -86,24 +107,20 @@ def rle_decode_binary(rle_str: str, device: Union[str, torch.device] = "cpu", ta
         elif tag == '!':
             break
         else:
-            # unexpected tag, skip
             x += count
-    
-    # Optional: pad/cast to target_shape
+
+    # Optional: pad to target_shape
     if target_shape is not None:
         H_max, W_max = target_shape
         if H_max < H or W_max < W:
             raise ValueError(f"Target shape {target_shape} is smaller than RLE array {(H,W)}")
-        padded = np.zeros(target_shape, dtype=np.uint8)
-        
-        W, H = tensor.shape
-        offset_w = (H_max - W) // 2
-        offset_h = (W_max  - H) // 2
+        padded = torch.zeros(target_shape, dtype=torch.bool, device=device)
 
-            # copy array into board
+        offset_h = (H_max - H) // 2
+        offset_w = (W_max - W) // 2
+
         padded[offset_h:offset_h+H, offset_w:offset_w+W] = tensor
         return padded
-
 
     return tensor
 
@@ -123,31 +140,45 @@ def load_rle_list(filepath: str) -> List[str]:
     with open(filepath, "r") as f:
         return json.load(f)
 
+def _load_single_rle(path, target_shape):
+    try:
+        with open(path, "r") as f:
+            txt = f.read()
+        arr = rle_decode_binary(txt, target_shape=target_shape)
+        name = os.path.basename(path)
+        return arr, name, None
+    except Exception as e:
+        return None, None, str(e)
+    
 # ---------- ANALYSIS ----------
-def load_rle_files(folder: str, max_files: int = None, target_shape=(200,200)):
-    arrs = []
-    sizes = []
-    alives = []
-    names = []
+def load_rle_files(folder: str, max_files: int = None, target_shape=(200,200), n_workers: int = 20, device: str=None):
     files = [f for f in os.listdir(folder) if f.endswith(".rle")]
     if max_files:
         files = files[:max_files]
+    paths = [os.path.join(folder, f) for f in files]
+
+    arrs, sizes, alives, names = [], [], [], []
     skipped_files = 0
-    print(f'Loading files ...')
-    for fn in files:
-        path = os.path.join(folder, fn)
-        with open(path, "r") as f:
-            txt = f.read()
-        try:
-            arr = rle_decode_binary(txt, target_shape=target_shape)# parse_rle(txt, target_shape=target_shape)
-            arrs.append(arr)
-            sizes.append(arr.shape[0] * arr.shape[1])
-            alives.append(int(arr.sum()))
-            names.append(fn)
-        except Exception as e:
-            skipped_files += 1
-    print(f'Loaded in total {len(arrs)}. Skipped {skipped_files} files during loading (either failed to parse or the grid is too large)')
-    return arrs, sizes, alives, names
+
+    print(f'Loading files in parallel with {n_workers} workers...')
+
+    # Create a partial function that includes the target_shape
+    worker_fn = partial(_load_single_rle, target_shape=target_shape)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        results = executor.map(worker_fn, paths)  # no lambda needed
+
+        for arr, name, error in results:
+            if error:
+                skipped_files += 1
+            else:
+                if device is not None:
+                    arr = arr.to(device)
+                arrs.append(arr)
+                names.append(name)
+
+    print(f'Loaded in total {len(arrs)}. Skipped {skipped_files} files during loading.')
+    return arrs, names
 
 @torch.no_grad()
 def board_hash(states: torch.Tensor, K: torch.Tensor, rotate: bool = True) -> torch.Tensor:
