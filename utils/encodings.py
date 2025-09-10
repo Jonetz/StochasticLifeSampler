@@ -180,48 +180,107 @@ def load_rle_files(folder: str, max_files: int = None, target_shape=(200,200), n
     print(f'Loaded in total {len(arrs)}. Skipped {skipped_files} files during loading.')
     return arrs, names
 
+@torch.jit.script
+def board_hash_weighted(states: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    B, H, W = states.shape
+    s = states.float().unsqueeze(1)  # (B,1,H,W) float32 for faster conv
+    kH, kW = K.shape
+    K_f = K.float().unsqueeze(0).unsqueeze(0)  # (1,1,kH,kW)
+
+    conv_out = F.conv2d(s, K_f, padding=kH//2).squeeze(1)  # (B,H,W)
+
+    # Collapse H,W into single number
+    powers = torch.arange(1, H*W + 1, device=states.device, dtype=torch.int64)
+    flat = conv_out.view(B, -1).to(torch.int64)
+    mod = 2**63 - 1
+    hashes = (flat * powers).sum(dim=1) % mod
+    return hashes
+
 @torch.no_grad()
-def board_hash(states: torch.Tensor, K: torch.Tensor, rotate: bool = True) -> torch.Tensor:
+def board_hash_zobrist(states: torch.Tensor, zobrist_table: torch.Tensor, rotate: bool = True) -> torch.Tensor:
     """
-    Compute a translational (and optionally rotational) equivariant hash for a batch of 2D boards.
+    Compute translational and optionally rotational equivariant Zobrist hash for a batch of 2D boards.
 
     Args:
-        states: (B, H, W) tensor, dtype=bool or uint8
-        K: (kH, kW) integer tensor for hashing. Must be precomputed and fixed for all comparisons.
-        rotate: if True, compute hashes for 4 rotations (0, 90, 180, 270 degrees) and pick max
+        states: (B,H,W) tensor, dtype=bool or uint8
+        zobrist_table: (4,H,W) tensor of int64 random values (precomputed)
+        rotate: if True, compute hashes for 0,90,180,270 deg rotations and pick the min
 
     Returns:
-        hashes: (B,) int64 tensor, unique-ish per board up to translation and optionally rotation.
+        hashes: (B,4) int64 tensor (256-bit hash split into 4 int64)
     """
     if states.dim() == 2:
         states = states.unsqueeze(0)
     elif states.dim() != 3:
-        raise ValueError(f'The states tensor must have 2 or 3 dimensions not {states.dim()} and shape {states.shape}')
+        raise ValueError(f"states must have shape (B,H,W) or (H,W), got {states.shape}")
+
     B, H, W = states.shape
-    kH, kW = K.shape
+    states = states.to(torch.int64)
 
-    # Convert to int64 for deterministic hash computation
-    s = states#.to(torch.int64)
+    layers = zobrist_table.unsqueeze(0)  # (1,4,H,W)
 
-    # Add batch and channel dimensions for conv2d
-    s = s.unsqueeze(1)  # (B,1,H,W)
-    K = K.unsqueeze(0).unsqueeze(0)  # (1,1,kH,kW)
-
-    # Convolution to compute translational hash
-    conv_out = F.conv2d(s, K, padding=kH//2)  # (B,1,H,W)
-    conv_out = conv_out.squeeze(1)  # (B,H,W)
-
+    # Prepare rotations
+    rotations = [states]
     if rotate:
-        convs = [conv_out]
-        for _ in range(3):
-            conv_out = torch.rot90(conv_out, 1, dims=(1,2))  # rotate 90 deg
-            convs.append(conv_out)
-        # Take the max over rotations to get rotation-equivariant hash
-        conv_out = torch.stack(convs, dim=0).amax(dim=0)  # (B,H,W)
+        for i in range(1, 4):
+            rotations.append(torch.rot90(states, i, dims=(1, 2)))
 
-    # Collapse H,W into single number per board
-    powers = torch.arange(1, H*W + 1, device=states.device, dtype=torch.int64)
-    flat = conv_out.view(B, -1)
-    hashes = (flat * powers).sum(dim=1)
+    # Stack rotations: (R,B,H,W)
+    rot_stack = torch.stack(rotations, dim=0)  # R=1 or 4
+
+    # Broadcast states over 4 layers: (R,B,1,H,W) * (1,1,4,H,W) -> (R,B,4,H,W)
+    active_vals = rot_stack.unsqueeze(2) * layers
+
+    # XOR over spatial dimensions (flatten H*W)
+    flat_vals = active_vals.view(*active_vals.shape[:3], -1)  # (R,B,4,H*W)
+    hashes = flat_vals[..., 0].clone()  # initialize with first element
+    for i in range(1, flat_vals.shape[-1]):
+        hashes ^= flat_vals[..., i]  # XOR accumulate
+
+    # Take min over rotations for rotation-equivariant hash
+    hashes = hashes.amin(dim=0)  # (B,4)
 
     return hashes
+
+import hashlib
+
+@torch.no_grad()
+def board_hash(states: torch.Tensor, rotate: bool = True) -> torch.Tensor:
+    """
+    Compute SHA-256 hash per board, optionally rotation-equivariant.
+    Returns a 256-bit hash as a 32-byte tensor per board.
+    
+    Args:
+        states: (B,H,W) or (H,W) tensor, dtype=bool or uint8
+        rotate: if True, compute hashes for 4 rotations and pick min
+    
+    Returns:
+        hashes: (B,32) uint8 tensor with SHA-256 digest per board
+    """
+    if states.dim() == 2:
+        states = states.unsqueeze(0)
+    B, H, W = states.shape
+    states = states.to(torch.uint8)
+
+    boards_to_hash = []
+
+    if rotate:
+        rotations = [states]
+        for _ in range(3):
+            rotations.append(torch.rot90(rotations[-1], 1, dims=(1,2)))
+        # Flatten boards along H*W dimension and convert to bytes
+        boards_to_hash = [r.reshape(B, -1).cpu().numpy().tobytes() for r in rotations]
+    else:
+        boards_to_hash = [states.reshape(B, -1).cpu().numpy().tobytes()]
+
+    # Compute SHA-256 for each board
+    hashes = []
+    for i in range(B):
+        min_digest = None
+        for rot_bytes in boards_to_hash:
+            board_bytes = rot_bytes[i*H*W:(i+1)*H*W]
+            digest = hashlib.sha256(board_bytes).digest()  # 32 bytes
+            if min_digest is None or digest < min_digest:
+                min_digest = digest
+        hashes.append(torch.tensor(list(min_digest), dtype=torch.int64))
+    return torch.stack(hashes, dim=0)  # (B,32)
