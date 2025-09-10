@@ -11,7 +11,7 @@ import tempfile
 from typing import Any, Callable, Optional, Tuple, List, Union, Sequence
 import numpy as np
 from core.Board import Board
-from utils.encodings import board_hash, save_rle_list, load_rle_list, rle_decode_binary
+from utils.encodings import board_hash, board_hash_weighted, board_hash_zobrist, save_rle_list, load_rle_list, rle_decode_binary
 from PIL import Image, ImageDraw
 import collections
 import imageio.v3 as iio
@@ -127,7 +127,7 @@ class GoLEngine:
             raise ValueError(f"Unknown border mode {self.border}")
 
     @torch.jit.script
-    def step_jit(states: torch.Tensor, kernel: torch.Tensor, pad_flag: int) -> torch.Tensor:
+    def step_jit(states: torch.Tensor, kernel: torch.Tensor, pad_flag: int, mask_border: bool = True) -> torch.Tensor:
         """
         JIT-compiled single Game of Life step.
 
@@ -153,8 +153,15 @@ class GoLEngine:
         nbh = F.conv2d(x_p, kernel).squeeze(1)
         survive = states & ((nbh == 2) | (nbh == 3))
         born = (~states) & (nbh == 3)
-        return survive | born
-    
+        out = survive | born
+
+        if mask_border:
+            out[..., 0:2, :] = 0
+            out[..., -2:, :] = 0
+            out[..., :, 0:2] = 0
+            out[..., :, -2:] = 0
+        return out
+        
     @torch.no_grad()
     def simulate(self,
                 board: Union['Board', torch.Tensor],
@@ -162,37 +169,8 @@ class GoLEngine:
                 return_trajectory: bool = False,
                 return_stability: Union[bool, int] = False
                 ) -> Union['Board', Tuple['Board', List[Any]], Tuple['Board', torch.Tensor]]:
-        """
-        Run simulation for a number of steps with optional tracking and hooks.
-
-        Args:
-            board: Board or tensor of shape (B,H,W) or (H,W).
-            steps: Number of simulation steps to run.
-            return_trajectory: If True, collects outputs of step_fn per step.
-            return_stability: 
-                - If False, no stability info returned.
-                - If True, returns first step at which each board repeats previous state.
-                - If int N, checks last N board hashes for stability.
-
-        Returns:
-            - If only returning board: Board.
-            - If return_trajectory: Tuple(Board, List[step_fn outputs])
-            - If return_stability: Tuple(Board, Tensor of first stable step per board)
-
-        Safeguards:
-            - Warns if return_stability conflicts with step_fn usage.
-            - Warns if return_trajectory and return_stability are both True.
-            - Supports 2D and batched boards.
-            - Automatically handles device conversion.
-            - Uses deque for stability window if integer passed.
-        """
-        if self._step_fn and return_stability:
-            print('Warning step function and return stability do not work together, '
-                'will return step function, if the step function is the identity and '
-                'skip oscillation is true, this is equivalent.')
-        if return_stability and return_trajectory:
-            print('Warning return_stability and return_trajectory cannot be set together, please choose one!')
-
+        
+        # -------------------- Setup --------------------
         if isinstance(board, Board):
             states = board._states.bool()
         elif isinstance(board, np.ndarray):
@@ -205,38 +183,40 @@ class GoLEngine:
         B, H, W = states.shape
         s = states.to(self.device)
 
-        # Decide step function
         fn = self._step_fn if self._step_fn else None
         if return_trajectory and fn is None:
             fn = lambda x, t: x.clone()
-
         results = [] if fn is not None else None
 
         # ---- run pre-training hooks ----
         for hook in self.pre_train_hooks:
             hook(s)
 
-        # -------- Stability setup --------
+        # -------------------- Stability setup --------------------
         stability_window = 5
         if isinstance(return_stability, int):
             stability_window = max(1, return_stability)
 
         if return_stability:
-            kernel = torch.randint(1, 2**16, size=(3, 3),
-                                device=self.device, dtype=torch.int64).float()
-            prev_hashes = collections.deque(maxlen=stability_window)
-            prev_hashes.append(board_hash(s.float(), kernel))
-            first_stable = torch.zeros(s.shape[0], dtype=torch.long, device=self.device)
+            kernel = torch.randint(1, 2**16, size=(3, 3), device=self.device, dtype=torch.int64).float()
+            prev_hashes_tensor = torch.empty(B, stability_window, device=self.device, dtype=torch.float64)
+            prev_hashes_len = 0
+            # Initialize with the first step
+            prev_hashes_tensor[:, prev_hashes_len] = board_hash_weighted(s.float(), kernel)
+            prev_hashes_len += 1
+            first_stable = torch.zeros(B, dtype=torch.long, device=self.device)
         else:
             kernel = None
 
-        # For skip_oscillation
+        # -------------------- Oscillation setup --------------------
         if self.skip_osci:
-            if kernel is None:  # ensure we have a hash kernel
-                kernel = torch.randint(1, 2**16, size=(3, 3),
-                                    device=self.device, dtype=torch.int64).float()
-            seen_hashes = torch.empty((0,), dtype=torch.int64, device=self.device)
+            if kernel is None:
+                kernel = torch.randint(1, 2**16, size=(3, 3), device=self.device, dtype=torch.int64).float()
+            osc_window = 50  # or whatever window you want
+            seen_hashes_tensor = torch.empty(B, osc_window, device=self.device, dtype=torch.float64)
+            seen_hashes_len = 0
 
+        # -------------------- Simulation loop --------------------
         for t in range(steps):
             # ---- run cancel hooks ----
             if self.cancel_condition and self.cancel_condition(s, t):
@@ -258,36 +238,54 @@ class GoLEngine:
 
             # -------- Stability check --------
             if return_stability:
-                hashes = board_hash(s.float(), kernel)
-                stable_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
+                hashes = board_hash_weighted(s.float(), kernel)  # [B]
+                if prev_hashes_len == 0:
+                    stable_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
+                else:
+                    stable_mask = (hashes.unsqueeze(1) == prev_hashes_tensor[:, :prev_hashes_len]).any(dim=1)
+                    newly_stable = (first_stable == 0) & stable_mask
+                    first_stable[newly_stable] = t + 1
 
-                for old in prev_hashes:
-                    stable_mask |= (hashes == old)
-
-                newly_stable = (first_stable == 0) & stable_mask
-                first_stable[newly_stable] = t + 1
-                prev_hashes.append(hashes)
+                # Append current hashes
+                if prev_hashes_len < stability_window:
+                    prev_hashes_tensor[:, prev_hashes_len] = hashes
+                    prev_hashes_len += 1
+                else:
+                    # Circular buffer
+                    prev_hashes_tensor = torch.cat([prev_hashes_tensor[:, 1:], hashes.unsqueeze(1)], dim=1)
 
             # -------- Oscillation detection --------
             if self.skip_osci:
-                hashes = board_hash(s.float(), kernel)
-                mask = torch.isin(hashes, seen_hashes)
-                if mask.any():
-                    final_board = Board(s, idx=None,
-                                        device=self.device,
-                                        meta=(board.meta.copy() if isinstance(board, Board) else {}))
-                    if return_stability:
-                        return final_board, first_stable
-                    if results is not None:
-                        return final_board, results
-                    return final_board
-                seen_hashes = torch.cat([seen_hashes, hashes])
+                hashes = board_hash_weighted(s.float(), kernel)
+                if seen_hashes_len == 0:
+                    seen_hashes_tensor[:, 0] = hashes
+                    seen_hashes_len = 1
+                else:
+                    matches = (hashes.unsqueeze(1) == seen_hashes_tensor[:, :seen_hashes_len]).any(dim=1)
+                    if matches.all():
+                        final_board = Board(
+                            s,
+                            idx=None,
+                            device=self.device,
+                            meta=(board.meta.copy() if isinstance(board, Board) else {})
+                        )
+                        if return_stability:
+                            return final_board, first_stable
+                        if results is not None:
+                            return final_board, results
+                        return final_board
+                    # Append current hashes
+                    if seen_hashes_len < osc_window:
+                        seen_hashes_tensor[:, seen_hashes_len] = hashes
+                        seen_hashes_len += 1
+                    else:
+                        # Circular buffer
+                        seen_hashes_tensor = torch.cat([seen_hashes_tensor[:, 1:], hashes.unsqueeze(1)], dim=1)
 
-        final_board = Board(s, idx=None,
+        final_board = Board(s.to(torch.bool), idx=None,
                             device=self.device,
                             meta=(board.meta.copy() if isinstance(board, Board) else {}))
 
-        # ---- run post-training hooks ----
         for hook in self.post_train_hooks:
             hook(s)
 
@@ -296,7 +294,6 @@ class GoLEngine:
         if results is not None:
             return final_board, results
         return final_board
-
 
     # ---------------------------
     # Getter / Setter for step_fn
@@ -430,9 +427,8 @@ class GoLEngine:
                 draw.rectangle([0, img.height - bar_height, progress, img.height], fill=(255, 0, 0))
 
             # draw counter (here every frame, adjust if needed)
-            if show_counter and idx % 100 == 0:
-                text = f"{idx}/{total_frames}"
-                draw.text((5, 5), text, fill=(255, 0, 0))
+            text = f"{idx}/{total_frames}"
+            draw.text((5, 5), text, fill=(255, 0, 0))
 
             frames.append(img)
 
@@ -443,7 +439,6 @@ class GoLEngine:
         ffmpeg_path = _find_ffmpeg()
         if ffmpeg_path is not None:
             tmpdir = tempfile.mkdtemp()
-            print(tmpdir)
             try:
                 # save frames to tmp PNGs
                 for i, frame in enumerate(frames):

@@ -184,7 +184,7 @@ class BlockFlipProposal(Proposal):
             Ah, Aw = self.box_size
             h_start = (H - Ah) // 2
             w_start = (W - Aw) // 2
-            h_end = h_start + Ah - 1  # -1 to avoid overflow for 2x2 block
+            h_end = h_start + Ah - 1
             w_end = w_start + Aw - 1
         else:
             h_start, h_end = 0, H-1

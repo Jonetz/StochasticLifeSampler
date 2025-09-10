@@ -40,13 +40,13 @@ class MethuselahScorer(Scorer):
         finalAlive = final_board.tensor.view(B, -1).sum(dim=1).float()
 
         # Scores = alive*3 + first_stable_idx
-        scores = finalAlive * 3 + first_stable_idx.float()
+        scores = finalAlive * 2 + first_stable_idx.float()
 
         # Exclude oscillators
         osc_periods = OscillationScorer(self.engine, steps=self.steps).score(batch)
         scores[osc_periods > 5] = 0.0
 
-        return scores
+        return scores * 5e-2
 
 class RotInvariantScorer:
     """

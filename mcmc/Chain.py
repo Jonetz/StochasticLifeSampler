@@ -5,9 +5,11 @@ except Exception as e:
     raise ImportError("This module requires PyTorch (torch). Install PyTorch and retry.") from e
 
 import math
+from typing import Optional
 from core.Board import Board
 from core.Scorer import Scorer
 from core.Proposal import Proposal
+from mcmc.Scheduler import BaseTemperatureScheduler
 
 class Chain:
     """
@@ -33,6 +35,7 @@ class Chain:
                  scorer: Scorer,
                  proposal: Proposal,
                  temperature: float = 1.0,
+                 scheduler: BaseTemperatureScheduler = None,
                  adaptive_steps: bool = False,
                  min_steps: int = 64,
                  max_steps: int = 4096,
@@ -42,8 +45,16 @@ class Chain:
         self.board = init_board        # Board with shape (N,H,W)
         self.scorer = scorer
         self.proposal = proposal
-        self.temperature = temperature
-        self.score = self.scorer.score(self.board)  # shape (N,)
+
+        N = init_board.shape[0]
+        self.score = self.scorer.score(self.board)     # (N,)
+
+        # Temperature Schduler        
+        self.scheduler = scheduler
+
+        # --- per-board state ---
+        self.temperatures = torch.full((N,), temperature, device=self.board.device)
+        self.steps = torch.full((N,), min_steps, device=self.board.device, dtype=torch.long)
         
         # Adaptive step settings
         self.adaptive_steps = adaptive_steps
@@ -51,13 +62,16 @@ class Chain:
         self.max_steps = max_steps
         self.increase_factor = increase_factor
         self.patience = patience
-        self.step_history = []  # store recent scores for adaptation
         self.threshold = 0.01 
         self.max_increment = 256
 
         if adaptive_steps:
             self.scorer.steps = self.min_steps
-            
+
+        # keep small rolling windows per board
+        self.step_history = [[] for _ in range(N)]  
+        self.last_accept_rate = torch.zeros(N, device=self.board.device)    
+        
     def step(self):
         """
         Perform one Metropolis-Hastings MCMC step for all boards in the batch.
@@ -78,41 +92,36 @@ class Chain:
         candidate_score = self.scorer.score(candidate)      # (N,)
 
         delta = candidate_score - self.score                # (N,)
+        
+        # per-board acceptance
+        rand = torch.rand_like(delta)
+        accept_prob = torch.exp(torch.clamp(delta / self.temperatures, max=0))
+        accept_mask = (delta >= 0) | (rand < accept_prob)
 
-        # Acceptance probabilities per board
-        accept_prob = torch.exp(torch.clamp(delta / self.temperature, max=0))  # (N,)
-        # Clamp delta / T <= 0 for negative deltas, otherwise prob=1
-        accept_mask = (delta >= 0) | (torch.rand_like(delta) < accept_prob)    # (N,)
-
-        # Apply acceptance per board
+        # update accepted boards
         self.board._states[accept_mask] = candidate._states[accept_mask]
         self.score[accept_mask] = candidate_score[accept_mask]
 
-        # Adaptive steps logic with damping
+        # update adaptive step length per board
         if self.adaptive_steps:
-            self.step_history.append(self.score.mean().item())
-            if len(self.step_history) > self.patience:
-                delta_avg = (self.step_history[-1] - self.step_history[-self.patience]) / self.patience
+            for i in range(len(self.score)):
+                self.step_history[i].append(self.score[i].item())
+                if len(self.step_history[i]) > self.patience:
+                    delta_avg = (self.step_history[i][-1] - self.step_history[i][0]) / self.patience
+                    if delta_avg < self.threshold:
+                        raw_increment = int(self.steps[i].item() * self.increase_factor)
+                        damping = math.exp(- (self.steps[i].item() / self.max_steps) * 2)
+                        increment = int(min(raw_increment * damping, self.max_increment))
+                        if increment > 0:
+                            self.steps[i] = min(self.steps[i] + increment, self.max_steps)
+                    self.step_history[i].pop(0)
 
-                if delta_avg < self.threshold:  # small improvement
-                    # Raw increment
-                    raw_increment = int(self.scorer.steps * self.increase_factor)
+        # optional: temperature annealing per board
+        if self.scheduler:
+            self.temperatures = self.scheduler.get_temperature(len(self.step_history), prev_temps=self.temperatures)
 
-                    # Damping factor: scales down as we approach max_steps
-
-                    remaining = max(1, self.max_steps - self.scorer.steps)
-                    damping = math.exp(- (self.scorer.steps / self.max_steps) * 2)
-
-                    increment = int(min(raw_increment * damping, self.max_increment))
-
-                    if increment > 0:
-                        self.scorer.steps = min(self.scorer.steps + increment, self.max_steps)
-
-                self.step_history.pop(0)
-
-
+        self.last_accept_rate = accept_mask.float()
         return self.score, accept_mask
-    
     def get_results(self):
         """
         Retrieve current boards and their scores as numpy arrays.
