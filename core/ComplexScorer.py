@@ -21,7 +21,7 @@ class MethuselahScorer(Scorer):
         return (flat * powers).sum(dim=1)
     
     @torch.no_grad()
-    def score(self, batch: Union['Board', torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union['Board', torch.Tensor], final_board: Union['Board', torch.Tensor]= None) -> torch.Tensor:
         """
         batch: (B,H,W) tensor
         returns: (B,) float scores
@@ -166,7 +166,7 @@ class CombinedScorer(Scorer):
         - Normalizes weights if requested
         - Works batch-wise on (N,H,W) tensors
     """
-    def __init__(self, engine, scorers: list[tuple[Scorer, float]], normalize: bool = True, reduction: str = "sum"):
+    def __init__(self, engine, scorers: list[tuple[Scorer, float]], normalize: bool = True, reduction: str = "sum", steps: int = 1):
         super().__init__(engine)
         self.scorers = [s for s, _ in scorers]
         weights = torch.tensor([w for _, w in scorers], dtype=torch.float32, device=engine.device)
@@ -175,6 +175,7 @@ class CombinedScorer(Scorer):
         self.weights = weights
         assert reduction in ("sum", "mean"), "reduction must be 'sum' or 'mean'"
         self.reduction = reduction
+        self.steps = steps
 
     def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
         if not torch.is_tensor(batch):
@@ -182,9 +183,10 @@ class CombinedScorer(Scorer):
         if not batch.device == self.engine.device:
             batch = batch.to(self.engine.device)
 
+        final_board = self.engine.simulate(batch, steps=self.steps) 
         scores = []
         for scorer in self.scorers:
-            scores.append(scorer.score(batch))  # (N,)
+            scores.append(scorer.score(batch, final_board=final_board))  # (N,)
         scores = torch.stack(scores, dim=1)  # (N, num_scorers)
 
         weighted = scores * self.weights.view(1, -1)

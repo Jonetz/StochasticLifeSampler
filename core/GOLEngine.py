@@ -127,39 +127,58 @@ class GoLEngine:
             raise ValueError(f"Unknown border mode {self.border}")
 
     @torch.jit.script
-    def step_jit(states: torch.Tensor, kernel: torch.Tensor, pad_flag: int, mask_border: bool = True) -> torch.Tensor:
+    def step_jit(states: torch.Tensor, kernel: torch.Tensor, pad_flag: int, radius: int = 3, mask_border: bool = True) -> torch.Tensor:
         """
-        JIT-compiled single Game of Life step.
+        JIT-compiled single Game of Life step with safe border pruning.
 
         Args:
             states: Binary tensor of shape (B,H,W).
             kernel: Convolution kernel for neighborhood counts.
             pad_flag: 0=wrap, 1=constant, 2=reflect for boundary handling.
+            radius: number of rows/cols from border to potentially prune.
+            mask_border: whether to apply safe border pruning.
 
         Returns:
             Tensor of same shape as input, updated cell states (bool).
-        
-        Safeguards:
-            - Converts states to float internally.
-            - Applies proper padding depending on pad_flag.
         """
+        B, H, W = states.shape
         x = states.float().unsqueeze(1)
+
+        # --- padding ---
         if pad_flag == 0:
             x_p = F.pad(x, (1, 1, 1, 1), mode='circular')
         elif pad_flag == 1:
             x_p = F.pad(x, (1, 1, 1, 1), mode='constant', value=0.0)
         else:
             x_p = F.pad(x, (1, 1, 1, 1), mode='reflect')
+
+        # --- neighborhood counts ---
         nbh = F.conv2d(x_p, kernel).squeeze(1)
         survive = states & ((nbh == 2) | (nbh == 3))
         born = (~states) & (nbh == 3)
         out = survive | born
 
-        if mask_border:
-            out[..., 0:2, :] = 0
-            out[..., -2:, :] = 0
-            out[..., :, 0:2] = 0
-            out[..., :, -2:] = 0
+        if mask_border and radius > 0:
+            # --- Top strip ---
+            top_strip = out[..., 0:radius, :]
+            active_mask = (top_strip != 0).cumsum(dim=1) > 0
+            out[..., 0:radius, :] = top_strip * active_mask
+
+            # --- Bottom strip ---
+            bottom_strip = out[..., -radius:, :]
+            active_mask = (torch.flip(bottom_strip, [1]) != 0).cumsum(dim=1) > 0
+            out[..., -radius:, :] = torch.flip(bottom_strip * torch.flip(active_mask, [1]), [1])
+
+            # --- Left strip ---
+            left_strip = out[..., :, 0:radius]
+            active_mask = (left_strip != 0).cumsum(dim=2) > 0
+            out[..., :, 0:radius] = left_strip * active_mask
+
+            # --- Right strip ---
+            right_strip = out[..., :, -radius:]
+            active_mask = (torch.flip(right_strip, [2]) != 0).cumsum(dim=2) > 0
+            out[..., :, -radius:] = torch.flip(right_strip * torch.flip(active_mask, [2]), [2])
+
         return out
         
     @torch.no_grad()
@@ -226,7 +245,8 @@ class GoLEngine:
             for hook in self.pre_step_hooks:
                 hook(s, t)
 
-            s = GoLEngine.step_jit(s, self.kernel, self.pad_flag)
+            mask_border = (t % 3 == 0)
+            s = GoLEngine.step_jit(s, self.kernel, self.pad_flag, mask_border=mask_border)
 
             # ---- run post-step hooks ----
             for hook in self.post_step_hooks:
@@ -364,7 +384,7 @@ class GoLEngine:
                         trajectory: Union[Sequence[torch.Tensor], torch.Tensor],
                         filepath: str,
                         fps: int = 10,
-                        scale: int = 4,
+                        scale: int = 1,
                         invert: bool = True,
                         show_progress: bool = True,
                         show_counter: bool = True):

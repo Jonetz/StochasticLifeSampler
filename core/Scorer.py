@@ -53,15 +53,15 @@ class AliveCellCountScorer(Scorer):
         - Converts input to float.
         - Runs simulation on engine before counting.
     """
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         """
         batch: (N, H, W) tensor, dtype=uint8 or bool
         returns: (N,) tensor of alive fractions
         """
         if not torch.is_tensor(batch):
             batch = batch.tensor
-        batch = batch.float()
-        batch = self.engine.simulate(batch, steps=self.steps)
+        batch = batch.float()        
+        batch = self.engine.simulate(batch, steps=self.steps) if final_board is None else final_board
         alive_frac = batch._states.sum(dim=(1, 2)) / (batch._states.shape[1] * batch._states.shape[2])
         return alive_frac
     
@@ -80,7 +80,7 @@ class StabilityScorer(Scorer):
         - Uses engine.simulate with return_trajectory=True.
         - Converts input to proper device and dtype.
     """
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         """
         batch: list of initial board tensors (N, H, W)
         Returns: float or tensor of scores per board
@@ -111,13 +111,13 @@ class ChangeRateScorer(Scorer):
         - Ensures tensors are on correct device.
         - Computes element-wise difference correctly for batch.
     """
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         if not torch.is_tensor(batch):
             batch = batch.tensor
         if not batch.device == self.engine.device:
             batch = batch.to(self.engine.device)        
-        batch = self.engine.simulate(batch, steps=self.steps)
-        batch_x = self.engine.simulate(batch)    
+        batch = self.engine.simulate(batch, steps=self.steps) if final_board is None else final_board
+        batch_x = self.engine.simulate(batch, steps=1)    
         # Compute elementwise difference
         diff = batch._states != batch_x._states
         # Fraction of changed cells per board
@@ -140,7 +140,7 @@ class EntropyScorer(Scorer):
         - Clamps alive fraction to avoid log(0).
         - Works batch-wise on (N,H,W) tensors.
     """
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         """
         batch: (N, H, W) tensor, dtype=uint8 or bool
         returns: (N,) tensor of entropies
@@ -149,6 +149,7 @@ class EntropyScorer(Scorer):
             batch = batch.tensor
         if not batch.device == self.engine.device:
             batch = batch.to(self.engine.device)
+        batch = self.engine.simulate(batch, steps=self.steps) if final_board is None else final_board
         batch = batch.float()
         alive_frac = batch.mean(dim=(1, 2))  # fraction of alive cells per board
         alive_frac = torch.clamp(alive_frac, 1e-6, 1-1e-6)
@@ -175,7 +176,7 @@ class ChaosScorer(Scorer):
         self.w_unique = weight_uniqueness
         self.eval_steps = 50  # number of steps for scoring
 
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         if not torch.is_tensor(batch):
             batch = batch.tensor
         batch = batch.to(self.engine.device, dtype=torch.float)
@@ -184,7 +185,7 @@ class ChaosScorer(Scorer):
 
         # --- Warmup ---
         if self.steps > 0:
-            batch = self.engine.simulate(batch, steps=self.steps).tensor.float()
+            batch = self.engine.simulate(batch, steps=self.steps).tensor.float() if final_board is None else final_board
 
         # --- Simulate eval_steps all at once ---
         _, traj = self.engine.simulate(batch, steps=self.eval_steps, return_trajectory=True)
@@ -230,14 +231,14 @@ class DiversityScorer(Scorer):
         - Converts tensor to float.
         - Returns CPU tensor.
     """
-    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
         """
         batch: (N, H, W) tensor
         returns: (N,) tensor of diversity scores
         """
         if not torch.is_tensor(batch):
             batch = batch.tensor
-        batch = batch.float()
+        batch = self.engine.simulate(batch, steps=self.steps).tensor.float() if final_board is None else final_board
         alive_frac = batch.mean(dim=(1, 2))
         return (alive_frac * (1 - alive_frac)).cpu()
 
