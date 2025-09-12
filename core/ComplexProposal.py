@@ -1,11 +1,9 @@
 from typing import Optional, Tuple
 import torch
-from core import Board
+from core.Board import Board
 from core.Proposal import Proposal
 from utils.encodings import load_rle_files
 from utils.neural_proposals import PatchNet
-
-# Pattern Proposal
 
 class PatternInsertProposal(Proposal):
     """
@@ -208,8 +206,6 @@ class AreaTransformProposal(Proposal):
 
         return b
 
-    
-# Neural Network proposal
 class PatchNetProposal(Proposal):
     """
     Uses trained model to a fill in a specific part of the patch net.
@@ -268,3 +264,54 @@ class PatchNetProposal(Proposal):
         b._states[:, h_insert:h_insert+self.patch_size, w_insert:w_insert+self.patch_size] = prop
 
         return b
+
+class NewBoardProposal(Proposal):
+    """
+    Proposal operator that discards the current state and 
+    proposes a completely new random board.
+
+    Uses Board.from_shape for efficient batch initialization.
+
+    Args:
+        fill_prob: Probability of a cell being alive (default 0.35).
+        fill_shape: Optional (H_box, W_box) subregion to fill; centered if provided.
+        device: Torch device (default: inferred from CUDA availability).
+    
+    Methods:
+        propose(board): Returns a new batch of boards with the same
+                        batch size and dimensions as input, but filled randomly.
+
+    Safeguards:
+        - Preserves batch size N, height H, width W from input board.
+        - Ensures returned board is on the correct device and dtype.
+    """
+
+    def __init__(self, 
+                 fill_prob: float = 0.35, 
+                 box_size: Optional[Tuple[int, int]] = None,
+                 name: Optional[str] = None,
+                 device: Optional[str] = None):
+        super().__init__(name=name or "NewBoardProposal", box_size=None, device=device)
+        self.fill_prob = fill_prob
+        self.box_size = box_size
+
+    def propose(self, board: Board) -> Board:
+        """
+        Discards the current state and proposes a new random board.
+
+        Args:
+            board (Board): Current board batch.
+
+        Returns:
+            Board: Newly sampled board batch with same dimensions as input.
+        """
+        N, H, W = board.tensor.shape
+
+        # Re-sample completely new boards
+        new_boards = Board.from_shape(
+            N=N, H=H, W=W,
+            device=self.device,
+            fill_prob=self.fill_prob,
+            fill_shape=self.box_size
+        )
+        return new_boards
