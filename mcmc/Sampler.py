@@ -121,11 +121,12 @@ class Sampler:
 
             scores = []
             accept_rates = []
+            score = 0
             for idx, chain in enumerate(self.chains):
                 try:
                     score, accepted = chain.step()
                 except Exception as e:
-                    msg = f'[Sampler] Error in chain step: {e}' + '\n' + f'Aborting!'
+                    msg = f'[Sampler] Error in chain step: {e}' + f'| Aborting chain step!'
                     self.logger.error(msg) if hasattr(self, 'logger') else print(msg)
                 scores.append(score)
                 accept_rates.append(chain.last_accept_rate)

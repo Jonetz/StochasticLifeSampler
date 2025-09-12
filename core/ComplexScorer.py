@@ -1,4 +1,3 @@
-from typing import Union
 import torch
 from core.Board import Board
 from core.Scorer import OscillationScorer, Scorer
@@ -43,8 +42,8 @@ class MethuselahScorer(Scorer):
         scores = finalAlive * 2 + first_stable_idx.float()
 
         # Exclude oscillators
-        osc_periods = OscillationScorer(self.engine, steps=self.steps).score(batch)
-        scores[osc_periods > 5] = 0.0
+        #osc_periods = OscillationScorer(self.engine, steps=self.steps).score(batch)
+        #scores[osc_periods > 5] = 0.0
 
         return scores * 5e-2
 

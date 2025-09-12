@@ -3,7 +3,8 @@ import torch
 import hashlib
 
 from core.Board import Board
-from core.GOLEngine import GoLEngine 
+from core.GOLEngine import GoLEngine
+from utils.encodings import board_hash_weighted 
 
 DEBUG = False
 # ---------- SCORERS ----------
@@ -275,6 +276,10 @@ class OscillationScorer(Scorer):
         - Restores step_fn after scoring.
         - DEBUG flag prints warning if no repeat found.
     """
+    def __init__(self, engine, steps = 100):
+        super().__init__(engine, steps)
+        self.kernel = torch.randint(1, 2**16, size=(3, 3), device=self.engine.device, dtype=torch.int64).float()
+
     def _hash_board(self, board: torch.Tensor) -> str:
         """
         Stable hash of a single board state.
@@ -291,10 +296,7 @@ class OscillationScorer(Scorer):
         N = batch.shape[0]
         periods = torch.zeros(N, device=self.engine.device)        
         self.engine.set_step_fn(
-            lambda s, t: [
-                hashlib.sha1(b.cpu().numpy().tobytes()).hexdigest()
-                for b in s  # batch of boards
-            ]
+            lambda s, t: board_hash_weighted(s, self.kernel)
         )
         _, traj = self.engine.simulate(batch, steps=self.steps)
 

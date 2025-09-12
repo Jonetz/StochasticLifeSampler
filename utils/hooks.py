@@ -59,7 +59,7 @@ def make_rle_saver(
                 # Make filename with timestamp, chain name, step & score
                 chain_name = getattr(chain.scorer, "name", f"chain{idx}")
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                fname = f"{chain_name}_step{t+1}_score{score_val:.3f}_{timestamp}.rle"
+                fname = f"{chain_name}_step{t+1}_score{int(score_val)}_{timestamp}.rle"
 
                 # Write to file
                 with open(os.path.join(outdir, fname), "w") as f:
