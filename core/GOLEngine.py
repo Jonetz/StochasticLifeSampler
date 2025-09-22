@@ -217,22 +217,22 @@ class GoLEngine:
             stability_window = max(1, return_stability)
 
         if return_stability:
-            kernel = torch.randint(1, 2**16, size=(3, 3), device=self.device, dtype=torch.int64).float()
-            prev_hashes_tensor = torch.empty(B, stability_window, device=self.device, dtype=torch.float64)
+            kernel1 = torch.randint(1, 2**61-1, (H, W), device=self.device, dtype=torch.int64)
+            kernel2 = torch.randint(1, 2**61-1, (H, W), device=self.device, dtype=torch.int64)
+            prev_hashes_tensor = torch.empty(B, stability_window, 2, device=self.device, dtype=torch.int64)
             prev_hashes_len = 0
-            # Initialize with the first step
-            prev_hashes_tensor[:, prev_hashes_len] = board_hash_weighted(s.float(), kernel)
+            prev_hashes_tensor[:, prev_hashes_len] = board_hash_weighted(s, kernel1, kernel2)
             prev_hashes_len += 1
             first_stable = torch.zeros(B, dtype=torch.long, device=self.device)
         else:
-            kernel = None
+            kernel1 = kernel2 = None
 
-        # -------------------- Oscillation setup --------------------
         if self.skip_osci:
-            if kernel is None:
-                kernel = torch.randint(1, 2**16, size=(3, 3), device=self.device, dtype=torch.int64).float()
-            osc_window = 50  # or whatever window you want
-            seen_hashes_tensor = torch.empty(B, osc_window, device=self.device, dtype=torch.float64)
+            if kernel1 is None or kernel2 is None:
+                kernel1 = torch.randint(1, 2**61-1, (H, W), device=self.device, dtype=torch.int64)
+                kernel2 = torch.randint(1, 2**61-1, (H, W), device=self.device, dtype=torch.int64)
+            osc_window = 50000
+            seen_hashes_tensor = torch.empty(B, osc_window, 2, device=self.device, dtype=torch.int64)
             seen_hashes_len = 0
 
         # -------------------- Simulation loop --------------------
@@ -258,48 +258,46 @@ class GoLEngine:
 
             # -------- Stability check --------
             if return_stability:
-                hashes = board_hash_weighted(s.float(), kernel)  # [B]
+                hashes = board_hash_weighted(s, kernel1, kernel2)  # (B,2)
                 if prev_hashes_len == 0:
                     stable_mask = torch.zeros(B, dtype=torch.bool, device=self.device)
                 else:
-                    stable_mask = (hashes.unsqueeze(1) == prev_hashes_tensor[:, :prev_hashes_len]).any(dim=1)
+                    cmp = (hashes.unsqueeze(1) == prev_hashes_tensor[:, :prev_hashes_len])  # (B, prev_len, 2)
+                    stable_mask = cmp.all(dim=-1).any(dim=1)
                     newly_stable = (first_stable == 0) & stable_mask
                     first_stable[newly_stable] = t + 1
 
-                # Append current hashes
+                # append
                 if prev_hashes_len < stability_window:
                     prev_hashes_tensor[:, prev_hashes_len] = hashes
                     prev_hashes_len += 1
                 else:
-                    # Circular buffer
                     prev_hashes_tensor = torch.cat([prev_hashes_tensor[:, 1:], hashes.unsqueeze(1)], dim=1)
 
-            # -------- Oscillation detection --------
+           # -------- Oscillation detection --------
             if self.skip_osci:
-                hashes = board_hash_weighted(s.float(), kernel)
+                hashes = board_hash_weighted(s, kernel1, kernel2)  # (B,2)
                 if seen_hashes_len == 0:
                     seen_hashes_tensor[:, 0] = hashes
                     seen_hashes_len = 1
                 else:
-                    matches = (hashes.unsqueeze(1) == seen_hashes_tensor[:, :seen_hashes_len]).any(dim=1)
+                    cmp = (hashes.unsqueeze(1) == seen_hashes_tensor[:, :seen_hashes_len])  # (B, seen_len, 2)
+                    matches = cmp.all(dim=-1).any(dim=1)  # both hash values must match
+
                     if matches.all():
-                        final_board = Board(
-                            s,
-                            idx=None,
-                            device=self.device,
-                            meta=(board.meta.copy() if isinstance(board, Board) else {})
-                        )
+                        final_board = Board(s, idx=None, device=self.device,
+                                            meta=(board.meta.copy() if isinstance(board, Board) else {}))
                         if return_stability:
                             return final_board, first_stable
                         if results is not None:
                             return final_board, results
                         return final_board
-                    # Append current hashes
+
+                    # append
                     if seen_hashes_len < osc_window:
                         seen_hashes_tensor[:, seen_hashes_len] = hashes
                         seen_hashes_len += 1
                     else:
-                        # Circular buffer
                         seen_hashes_tensor = torch.cat([seen_hashes_tensor[:, 1:], hashes.unsqueeze(1)], dim=1)
 
         final_board = Board(s.to(torch.bool), idx=None,
