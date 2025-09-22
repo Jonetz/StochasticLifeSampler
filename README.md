@@ -1,14 +1,11 @@
-# 🌀 Stochastic Life Sampler: Exploring Conway's Game of Life with Stochastic Intelligence
+<img src="data\GOL-MCMC.gif" alt="GOL-MCMC simulation" width="800">
 
-![GOL-MCMC simulation](data\GOL-MCMC.gif)
-
-
+# Stochastic Life Sampler: Exploring Conway's Game of Life with Stochastic Intelligence
 Discover fascinating patterns in Conway's Game of Life using **Markov Chain Monte Carlo (MCMC)**! 
 
 This GPU-accelerated framework goes beyond random searches, letting you optimize initial board configurations for methuselahs, oscillators, diehards, chaotic structures, and more.
 
 ---
-
 ## 🚀 Features
 
 - **Fast GPU Simulation**: `GoLEngine` accelerates Game of Life simulations using PyTorch tensors.
