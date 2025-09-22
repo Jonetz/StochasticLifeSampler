@@ -1,3 +1,4 @@
+import math
 import torch
 from core.Board import Board
 from core.Scorer import OscillationScorer, Scorer
@@ -194,3 +195,72 @@ class CombinedScorer(Scorer):
             return weighted.sum(dim=1)  # (N,)
         else:  # mean
             return weighted.mean(dim=1)  # (N,)
+        
+class MovementScorer(Scorer):
+    """
+    Rewards moving structures:
+    - Each alive cell contributes proportional to its squared distance from the board center
+    - Accumulated over sliding windows
+    - Naturally favors long-lived and far-away structures
+    """
+
+    def __init__(self, engine, steps: int = 128, window: int = 16):
+        super().__init__(engine)
+        self.steps = steps
+        self.window = window
+
+    @torch.no_grad()
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        batch = batch.to(self.engine.device).float()
+        B, H, W = batch.shape
+        device = batch.device
+
+        # Precompute distance squared from center for each cell
+        ys = torch.arange(H, device=device).view(H, 1).float()
+        xs = torch.arange(W, device=device).view(1, W).float()
+        cy, cx = H/2, W/2
+        dist2 = (ys - cy)**2 + (xs - cx)**2  # (H, W)
+
+        score = torch.zeros(B, device=device)
+
+        board = batch
+        for _ in range(0, self.steps, self.window):
+            board = self.engine.simulate(board, steps=self.window).tensor.float()
+            # weighted sum of alive cells by squared distance
+            score += (board * dist2).sum(dim=(1, 2))
+
+        # optional scaling
+        return score * 15-3
+
+class CompactnessScorer(Scorer):
+    """
+    Rewards compactness but ignores cells near edges (within margin).
+    """
+    def __init__(self, engine, steps: int = 128, margin: int = 5):
+        super().__init__(engine)
+        self.steps = steps
+        self.margin = margin
+
+    @torch.no_grad()
+    def score(self, batch: Union[Board, torch.Tensor]) -> torch.Tensor:
+        if not torch.is_tensor(batch):
+            batch = batch.tensor
+        B, H, W = batch.shape
+
+        final_board = self.engine.simulate(batch, steps=self.steps)
+        s = final_board.tensor.bool()
+
+        # mask edges
+        inner = torch.zeros_like(s)
+        inner[:, self.margin:H-self.margin, self.margin:W-self.margin] = 1
+        s = s & inner.bool()
+
+        # bounding box
+        ys = s.any(dim=2).float().sum(dim=1)
+        xs = s.any(dim=1).float().sum(dim=1)
+        area = ys * xs
+        alive = s.view(B, -1).sum(dim=1).float()
+
+        return (alive / (area + 1)) * 1e-1
