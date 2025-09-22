@@ -1,4 +1,7 @@
-# 🌀 GOL-MCMC: Exploring Conway's Game of Life with Stochastic Intelligence
+# 🌀 Stochastic Life Sampler: Exploring Conway's Game of Life with Stochastic Intelligence
+
+![GOL-MCMC simulation](data\GOL-MCMC.gif)
+
 
 Discover fascinating patterns in Conway's Game of Life using **Markov Chain Monte Carlo (MCMC)**! 
 
