@@ -182,19 +182,44 @@ def load_rle_files(folder: str, max_files: int = None, target_shape=(200,200), n
 
 @torch.jit.script
 def board_hash_weighted(states: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    """
+    Robust hash for Game of Life states.
+    - states: (B,H,W) bool or 0/1 tensor
+    - K: (H,W) int64 random weights (fixed per run)
+    Returns: (B,) int64 hash values
+    """
     B, H, W = states.shape
-    s = states.float().unsqueeze(1)  # (B,1,H,W) float32 for faster conv
-    kH, kW = K.shape
-    K_f = K.float().unsqueeze(0).unsqueeze(0)  # (1,1,kH,kW)
 
-    conv_out = F.conv2d(s, K_f, padding=kH//2).squeeze(1)  # (B,H,W)
+    # ensure int64
+    s = states.to(torch.int64)
 
-    # Collapse H,W into single number
-    powers = torch.arange(1, H*W + 1, device=states.device, dtype=torch.int64)
-    flat = conv_out.view(B, -1).to(torch.int64)
-    mod = 2**63 - 1
-    hashes = (flat * powers).sum(dim=1) % mod
+    # apply random weights per cell
+    weighted = s * K  # (B,H,W)
+
+    # use a large prime modulus to reduce collisions
+    mod = 2305843009213693951  # 2**61 - 1 (Mersenne prime)
+    hashes = weighted.view(B, -1).sum(dim=1) % mod
+
     return hashes
+
+@torch.jit.script
+def board_hash_weighted(states: torch.Tensor, K1: torch.Tensor, K2: torch.Tensor) -> torch.Tensor:
+    """
+    Robust dual-hash for Game of Life boards.
+    states: (B,H,W) bool/int tensor
+    K1, K2: (H,W) int64 random weights (fixed for run)
+    Returns: (B,2) int64 hashes
+    """
+    B, H, W = states.shape
+    s = states.to(torch.int64)
+
+    mod = 2305843009213693951  # 2**61 - 1, large prime
+
+    h1 = (s * K1).view(B, -1).sum(dim=1) % mod
+    h2 = (s * K2).view(B, -1).sum(dim=1) % mod
+
+    return torch.stack([h1, h2], dim=-1)  # (B,2)
+
 
 @torch.no_grad()
 def board_hash_zobrist(states: torch.Tensor, zobrist_table: torch.Tensor, rotate: bool = True) -> torch.Tensor:
