@@ -182,10 +182,14 @@ class AreaTransformProposal(Proposal):
             # Random patch size
             ph = torch.randint(self.min_patch, self.max_patch + 1, (1,)).item()
             pw = torch.randint(self.min_patch, self.max_patch + 1, (1,)).item()
+        ph = min(ph, h_end - h_start)
+        pw = min(pw, w_end - w_start)
+
 
         # Random position (ensure patch fits inside bounding box)
-        i = torch.randint(h_start, max(h_start+1, h_end - ph + 1), (1,)).item()
-        j = torch.randint(w_start, max(w_start+1, w_end - pw + 1), (1,)).item()
+        i = torch.randint(h_start, h_end - ph + 1, (1,)).item()
+        j = torch.randint(w_start, w_end - pw + 1, (1,)).item()
+
 
         # Extract patch
         patch = b._states[idx, i:i+ph, j:j+pw]
