@@ -445,8 +445,9 @@ class GoLEngine:
                 draw.rectangle([0, img.height - bar_height, progress, img.height], fill=(255, 0, 0))
 
             # draw counter (here every frame, adjust if needed)
-            text = f"{idx}/{total_frames}"
-            draw.text((5, 5), text, fill=(255, 0, 0))
+            if show_counter:
+                text = f"{idx}/{total_frames}"
+                draw.text((5, 5), text, fill=(255, 0, 0))
 
             frames.append(img)
 
