@@ -63,8 +63,8 @@ class AliveCellCountScorer(Scorer):
             batch = batch.tensor
         batch = batch.float()        
         batch = self.engine.simulate(batch, steps=self.steps) if final_board is None else final_board
-        alive_frac = batch._states.sum(dim=(1, 2)) / (batch._states.shape[1] * batch._states.shape[2])
-        return alive_frac
+        alive_count = batch._states.sum(dim=(1, 2)) #/ (batch._states.shape[1] * batch._states.shape[2])
+        return alive_count.float() * 0.3
     
 # ---------- 2. StabilityScorer ----------
 class StabilityScorer(Scorer):
@@ -161,55 +161,83 @@ class EntropyScorer(Scorer):
 class ChaosScorer(Scorer):
     """
     Estimates "chaoticity" of Game of Life boards.
-    Computes metrics over the last 50 generations after initial `steps`.
+
+    Computes metrics over a trajectory:
+      - Entropy of alive fraction
+      - Variance of bounding box size
+      - Temporal uniqueness via state hashes
 
     Args:
-        steps: Number of "warmup" generations to simulate
-        weight_entropy: weight for alive-fraction entropy
-        weight_growth: weight for bounding-box growth variance
-        weight_uniqueness: weight for temporal uniqueness
+        steps: Number of warmup generations before evaluation.
+        weight_entropy: Weight for alive-fraction entropy.
+        weight_growth: Weight for bounding-box growth variance.
+        weight_uniqueness: Weight for temporal uniqueness.
+        eval_steps: Number of evaluation steps after warmup/final board.
     """
-    def __init__(self, engine, steps=5, weight_entropy=1.0, weight_growth=1.0, weight_uniqueness=1.0):
+    def __init__(self, engine, 
+                 steps: int = 5,
+                 weight_entropy: float = 1.0,
+                 weight_growth: float = 1.0,
+                 weight_uniqueness: float = 1.0,
+                 eval_steps: int = 50):
         super().__init__(engine)
         self.steps = steps
         self.w_entropy = weight_entropy
         self.w_growth = weight_growth
         self.w_unique = weight_uniqueness
-        self.eval_steps = 50  # number of steps for scoring
+        self.eval_steps = eval_steps
 
-    def score(self, batch: Union[Board, torch.Tensor], final_board: Union[Board, torch.Tensor] = None ) -> torch.Tensor:
+    def score(self, 
+              batch: Union[Board, torch.Tensor], 
+              final_board: Union[Board, torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute chaoticity score for a batch of boards.
+
+        Args:
+            batch: Initial board batch.
+            final_board: If provided, skip warmup and start from here.
+
+        Returns:
+            Tensor of shape (N,) with scores for each board in the batch.
+        """
+        # --- Normalize input ---
         if not torch.is_tensor(batch):
             batch = batch.tensor
         batch = batch.to(self.engine.device, dtype=torch.float)
-
         N, H, W = batch.shape
 
-        # --- Warmup ---
-        if self.steps > 0:
-            batch = self.engine.simulate(batch, steps=self.steps).tensor.float() if final_board is None else final_board
+        # --- Warmup or use final board ---
+        if final_board is not None:
+            if isinstance(final_board, Board):
+                start = final_board.tensor.float().to(self.engine.device)
+            else:
+                start = final_board.to(self.engine.device, dtype=torch.float)
+        else:
+            start = self.engine.simulate(batch, steps=self.steps).tensor.float()
 
-        # --- Simulate eval_steps all at once ---
-        _, traj = self.engine.simulate(batch, steps=self.eval_steps, return_trajectory=True)
-        # traj shape: (eval_steps, N, H, W)
-        traj = torch.stack(traj).to(self.engine.device).to(torch.float16)
+        # --- Simulate trajectory ---
+        _, traj = self.engine.simulate(start, steps=self.eval_steps, return_trajectory=True)
+        traj = torch.stack(traj).to(self.engine.device).to(torch.float32)  # (eval_steps, N, H, W)
 
-        # --- Metrics in batch ---
+        # --- Entropy of alive fraction ---
         alive_frac = traj.mean(dim=(2, 3))  # (eval_steps, N)
         alive_frac = torch.clamp(alive_frac, 1e-6, 1 - 1e-6)
-        entropies = -(alive_frac * torch.log(alive_frac) + (1 - alive_frac) * torch.log(1 - alive_frac))
+        entropies = -(alive_frac * torch.log(alive_frac) +
+                      (1 - alive_frac) * torch.log(1 - alive_frac))
         ent_score = entropies.mean(dim=0)  # (N,)
 
+        # --- Bounding box variance ---
         mask = traj > 0.5
-        ys = mask.any(dim=3).float().sum(dim=2)  # (eval_steps, N)
-        xs = mask.any(dim=2).float().sum(dim=2)  # (eval_steps, N)
-        bboxes = ys * xs
-        growth_var = bboxes.var(dim=0)
+        ys = mask.any(dim=3).float().sum(dim=2)  # height
+        xs = mask.any(dim=2).float().sum(dim=2)  # width
+        growth_var = (ys * xs).var(dim=0)
 
-        # uniqueness via hash
-        coords = torch.arange(H*W, device=traj.device, dtype=torch.float).view(1, 1, H, W)
+        # --- Temporal uniqueness (hash-based) ---
+        coords = torch.arange(H * W, device=traj.device, dtype=torch.float).view(1, 1, H, W)
         hashes = (traj * coords).sum(dim=(2, 3))  # (eval_steps, N)
         uniqueness_score = hashes.std(dim=0)
 
+        # --- Weighted sum ---
         total_score = (
             self.w_entropy * ent_score +
             self.w_growth * growth_var +
