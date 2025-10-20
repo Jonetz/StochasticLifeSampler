@@ -127,4 +127,4 @@ GOL/
 
 ## ⚖️ License
 
-MIT License. See `LICENSE` for details.
+Apache 2.0 License. See `LICENSE` for details.
