@@ -117,7 +117,7 @@ GOL/
 ---
 
 ## 📚 References
-- [Describing Post](https://jonetz.github.io/year-archive/) 
+- [Describing Post](Stochastic-Search) 
   
 - [Conway's Game of Life](https://en.wikipedia.org/wiki/Conway's_Game_of_Life)
 - [Metropolis-Hastings Algorithm](https://en.wikipedia.org/wiki/Metropolis%E2%80%93Hastings_algorithm)
